@@ -5,7 +5,11 @@ source /etc/device_config
 file=/sys/kernel/config/usb_gadget/composite_gadget/functions/mass_storage.0/lun.0/file
 bootimage=/mnt/msd/boot.frm
 conf=/mnt/msd/config.txt
+jffs2conf=/mnt/msd/config.frm
 img=/opt/vfat.img
+
+JFFS2_BASE=1179648
+JFFS2_CONFIG_ERROR=/mnt/msd/FAILED_JFFS2_CONFIG_ERROR
 
 ini_parser() {
  FILE=$1
@@ -15,7 +19,7 @@ ini_parser() {
     -e 's/[[:space:]]*$//' \
     -e 's/^[[:space:]]*//' \
     -e "s/^\(.*\)=\([^\"']*\)$/\1=\"\2\"/" \
-   < $FILE \
+    "$FILE" \
     | sed -n -e "/^\[$SECTION\]/,/^\s*\[/{/^[^;].*\=.*/p;}"`
 }
 
@@ -42,6 +46,110 @@ flash_indication_on() {
 
 flash_indication_off() {
 	echo heartbeat > /sys/class/leds/led0:green/trigger
+}
+
+jffs2_config_error() {
+	echo "$1" > ${JFFS2_CONFIG_ERROR}
+	do_reset=0
+}
+
+validate_jffs2_config() {
+	rm -f ${JFFS2_CONFIG_ERROR}
+	CONFIG_JFFS2_SIZE=
+
+	if [ ! -s "${jffs2conf}" ]; then
+		jffs2_config_error "Missing ${jffs2conf}. Install firmware with a valid config.frm file."
+		return 1
+	fi
+
+	sed -e 's/[[:space:]]//g' \
+	    -e '/^#/d' \
+	    -e '/^$/d' \
+	    "${jffs2conf}" > /opt/jffs2_config.active
+
+	if grep -qv '^JFFS2_SIZE_MIB=[1-5]$' /opt/jffs2_config.active; then
+		jffs2_config_error "Invalid config.frm entry. Use exactly one uncommented JFFS2_SIZE_MIB=1..5 line."
+		rm -f /opt/jffs2_config.active
+		return 1
+	fi
+
+	active_count=`grep -c '^JFFS2_SIZE_MIB=[1-5]$' /opt/jffs2_config.active`
+	if [ "${active_count}" != "1" ]; then
+		jffs2_config_error "Invalid config.frm. Exactly one JFFS2_SIZE_MIB option must be uncommented."
+		rm -f /opt/jffs2_config.active
+		return 1
+	fi
+
+	CONFIG_JFFS2_SIZE=`sed -n 's/^JFFS2_SIZE_MIB=//p' /opt/jffs2_config.active`
+	rm -f /opt/jffs2_config.active
+	return 0
+}
+
+set_jffs2_layout_values() {
+	case "$1" in
+		1)
+			JFFS2_NVMFS_SIZE=917504
+			JFFS2_FIT_OFFSET=2097152
+			JFFS2_FIT_PARTITION_SIZE=31457280
+			;;
+		2)
+			JFFS2_NVMFS_SIZE=2097152
+			JFFS2_FIT_OFFSET=3276800
+			JFFS2_FIT_PARTITION_SIZE=30277632
+			;;
+		3)
+			JFFS2_NVMFS_SIZE=3145728
+			JFFS2_FIT_OFFSET=4325376
+			JFFS2_FIT_PARTITION_SIZE=29229056
+			;;
+		4)
+			JFFS2_NVMFS_SIZE=4194304
+			JFFS2_FIT_OFFSET=5373952
+			JFFS2_FIT_PARTITION_SIZE=28180480
+			;;
+		5)
+			JFFS2_NVMFS_SIZE=5242880
+			JFFS2_FIT_OFFSET=6422528
+			JFFS2_FIT_PARTITION_SIZE=27131904
+			;;
+	esac
+}
+
+mtd_size_dec() {
+	mtd_name="$1"
+	mtd_size_hex=`awk -v name="\"${mtd_name}\"" '$4 == name { print $2 }' /proc/mtd`
+	echo $((0x${mtd_size_hex}))
+}
+
+mtd_erasesize_dec() {
+	mtd_name="$1"
+	mtd_erasesize_hex=`awk -v name="\"${mtd_name}\"" '$4 == name { print $3 }' /proc/mtd`
+	echo $((0x${mtd_erasesize_hex}))
+}
+
+prepare_jffs2_layout() {
+	current_nvmfs_size=`mtd_size_dec qspi-nvmfs`
+	current_fit_offset=$((JFFS2_BASE + current_nvmfs_size))
+
+	if [ "${JFFS2_FIT_OFFSET}" -lt "${current_fit_offset}" ]; then
+		jffs2_config_error "Cannot shrink /mnt/jffs2 in one firmware install. Select the current or a larger size, reboot, then shrink in a second install."
+		return 1
+	fi
+
+	extra_jffs2_size=$((JFFS2_FIT_OFFSET - current_fit_offset))
+	if [ "${JFFS2_NVMFS_SIZE}" != "${current_nvmfs_size}" ]; then
+		umount /mnt/jffs2 2>/dev/null
+		flash_erase -j /dev/mtd2 0 0 || return 1
+
+		if [ "${extra_jffs2_size}" -gt 0 ]; then
+			erasesize=`mtd_erasesize_dec qspi-linux`
+			erase_count=$((extra_jffs2_size / erasesize))
+			flash_erase -j /dev/mtd3 0 ${erase_count} || return 1
+		fi
+	fi
+
+	FIRMWARE_SEEK_BYTES=$((JFFS2_FIT_OFFSET - current_fit_offset))
+	return 0
 }
 
 make_diagnostic_report () {
@@ -145,12 +253,12 @@ process_ini() {
 handle_boot_frm () {
 	FILE="$1"
 	rm -f /mnt/msd/BOOT_SUCCESS /mnt/msd/BOOT_FAILED /mnt/msd/FAILED_MTD_PARTITION_ERROR /mnt/msd/FAILED_BOOT_CHSUM_ERROR
-	head -3 /proc/mtd | sed 's/00010000/00001000/g' > /opt/mtd
+	head -2 /proc/mtd | sed 's/00010000/00001000/g' > /opt/mtd
 
 	md5=`tail -c 33 ${FILE}`
 	head -c -33 ${FILE} > /opt/boot_and_env_and_mtdinfo.bin
 
-	tail -c 1024 /opt/boot_and_env_and_mtdinfo.bin | head -3 > /opt/mtd-info.txt
+	tail -c 1024 /opt/boot_and_env_and_mtdinfo.bin | head -2 > /opt/mtd-info.txt
 	head -c -1024 /opt/boot_and_env_and_mtdinfo.bin > /opt/boot_and_env.bin
 
 	tail -c 131072 /opt/boot_and_env.bin > /opt/u-boot-env.bin
@@ -182,16 +290,35 @@ handle_boot_frm () {
 handle_frimware_frm () {
 	FILE="$1"
 	MAGIC="$2"
-	rm -f /mnt/msd/SUCCESS /mnt/msd/FAILED /mnt/msd/FAILED_FIRMWARE_CHSUM_ERROR
+	rm -f /mnt/msd/SUCCESS /mnt/msd/FAILED /mnt/msd/FAILED_FIRMWARE_CHSUM_ERROR ${JFFS2_CONFIG_ERROR}
 	md5=`tail -c 33 ${FILE}`
 	head -c -33 ${FILE} > /opt/firmware.frm
-	FRM_SIZE=`cat /opt/firmware.frm | wc -c | xargs printf "%X\n"`
+	FRM_SIZE_DEC=`cat /opt/firmware.frm | wc -c | xargs`
+	FRM_SIZE=`printf "%X\n" ${FRM_SIZE_DEC}`
 	frm=`md5sum /opt/firmware.frm | cut -d ' ' -f 1`
 	if [ "$frm" = "$md5" ]
 	then
-		flash_indication_on
-		grep -q "${MAGIC}"  /opt/firmware.frm && dd if=/opt/firmware.frm of=/dev/mtdblock3 bs=64k && fw_setenv fit_size ${FRM_SIZE} && do_reset=1 && touch /mnt/msd/SUCCESS || touch /mnt/msd/FAILED
-		flash_indication_off
+		if validate_jffs2_config && grep -q "${MAGIC}" /opt/firmware.frm; then
+			set_jffs2_layout_values "${CONFIG_JFFS2_SIZE}"
+			if [ "${FRM_SIZE_DEC}" -gt "${JFFS2_FIT_PARTITION_SIZE}" ]; then
+				jffs2_config_error "Firmware image is too large for the selected JFFS2 layout."
+				touch /mnt/msd/FAILED
+			else
+				flash_indication_on
+				if prepare_jffs2_layout; then
+					seek_blocks=$((FIRMWARE_SEEK_BYTES / 65536))
+					dd if=/opt/firmware.frm of=/dev/mtdblock3 bs=64k seek=${seek_blocks} conv=notrunc && \
+						fw_setenv fit_size ${FRM_SIZE} && \
+						fw_setenv jffs2_size_mib ${CONFIG_JFFS2_SIZE} && \
+						do_reset=1 && touch /mnt/msd/SUCCESS || touch /mnt/msd/FAILED
+				else
+					touch /mnt/msd/FAILED
+				fi
+				flash_indication_off
+			fi
+		else
+			touch /mnt/msd/FAILED
+		fi
 	else
 		echo $frm $md5 > /mnt/msd/FAILED_FIRMWARE_CHSUM_ERROR
 		do_reset=0
@@ -216,7 +343,11 @@ do
 	if [[ -s /mnt/msd/$TARGET-fw-*.zip ]]
 	then
 		mv /mnt/msd/$TARGET-fw-*.zip /opt/
-		unzip -o /opt/$TARGET-fw-*.zip *.frm -d /mnt/msd
+		firmware_base=`basename ${FIRMWARE}`
+		unzip -o /opt/$TARGET-fw-*.zip ${firmware_base} boot.frm -d /mnt/msd
+		if [[ ! -s ${jffs2conf} ]]; then
+			unzip -o /opt/$TARGET-fw-*.zip config.frm -d /mnt/msd
+		fi
 		rm /opt/$TARGET-fw-*.zip
 	fi
 

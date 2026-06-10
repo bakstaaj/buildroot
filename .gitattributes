@@ -1,0 +1,7 @@
+*.gitattributes text eol=lf
+*.sh text eol=lf
+*.frm text eol=lf
+board/pluto/S[0-9][0-9]* text eol=lf
+board/pluto/device_* text eol=lf
+board/pluto/mdev.conf text eol=lf
+board/pluto/fw_env.config text eol=lf
