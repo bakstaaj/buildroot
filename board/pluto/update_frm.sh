@@ -165,10 +165,13 @@ handle_frimware_frm () {
 
 
 
-if [[ -f ${FRM_FILE} ]] && [[ ${FRM_FILE: -4} == ".frm" ]] && [[ -s ${FRM_FILE} ]]
-then
-	handle_frimware_frm "${FRM_FILE}" "${FRM_MAGIC}"
-else
-	echo "Failed"
-	exit 1
-fi
+case "${FRM_FILE}" in
+	*.frm)
+		if [ -f "${FRM_FILE}" ] && [ -s "${FRM_FILE}" ]; then
+			handle_frimware_frm "${FRM_FILE}" "${FRM_MAGIC}"
+		fi
+		;;
+esac
+
+echo "Failed"
+exit 1
