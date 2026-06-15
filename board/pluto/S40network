@@ -7,13 +7,26 @@
 
 source /etc/device_config
 
+detect_ad936x_defaults () {
+	MODEL_TEXT=`cat /sys/firmware/devicetree/base/model 2> /dev/null`
+
+	AD936X_DEFAULT_ATTR_VAL=ad9364
+	AD936X_DEFAULT_MODE=1r1t
+
+	if echo "$MODEL_TEXT" | grep -q "Rev.C"
+	then
+		AD936X_DEFAULT_ATTR_VAL=ad9361
+		AD936X_DEFAULT_MODE=2r2t
+	fi
+}
+
 create_system_files () {
 
 	UDHCPD_CONF=/etc/udhcpd.conf
 	CONF=/opt/config.txt
 	IFAC=/etc/network/interfaces
 
-	HOSTNAME=`fw_printenv -n hostname 2> /dev/null || cat /etc/hostname`
+	HOSTNAME=`fw_printenv -n hostname 2> /dev/null || echo pluto`
 	echo $HOSTNAME > /etc/hostname
 
 	IPADDR=`fw_printenv -n ipaddr 2> /dev/null || echo 192.168.2.1`
@@ -22,6 +35,9 @@ create_system_files () {
 
 	ETH_IPADDR=`fw_printenv -n ipaddr_eth 2> /dev/null`
 	ETH_NETMASK=`fw_printenv -n netmask_eth 2> /dev/null || echo 255.255.255.0`
+	ETH_FALLBACK_IP=`fw_printenv -n ipaddr_eth_fallback 2> /dev/null || echo 192.168.3.1`
+	ETH_FALLBACK_START=`fw_printenv -n ipaddr_eth_fallback_start 2> /dev/null || echo 192.168.3.10`
+	ETH_FALLBACK_END=`fw_printenv -n ipaddr_eth_fallback_end 2> /dev/null || echo 192.168.3.99`
 
 	WLAN_SSID=`fw_printenv -n ssid_wlan 2> /dev/null`
 	WLAN_PWD=`fw_printenv -n pwd_wlan 2> /dev/null`
@@ -30,6 +46,20 @@ create_system_files () {
 	XO_CORRECTION=`fw_printenv -n xo_correction 2> /dev/null`
 	UDC_HANDLE_SUSPEND=`fw_printenv -n udc_handle_suspend 2> /dev/null || echo 0`
 	USB_ETH_MODE=`fw_printenv -n usb_ethernet_mode 2> /dev/null || echo rndis`
+	detect_ad936x_defaults
+	AD936X_ATTR_NAME=`fw_printenv -n attr_name 2> /dev/null || echo compatible`
+	AD936X_ATTR_VAL=`fw_printenv -n attr_val 2> /dev/null || echo $AD936X_DEFAULT_ATTR_VAL`
+	AD936X_COMPATIBLE=`fw_printenv -n compatible 2> /dev/null || echo $AD936X_ATTR_VAL`
+	AD936X_MODE=`fw_printenv -n mode 2> /dev/null || echo $AD936X_DEFAULT_MODE`
+	AD936X_FORCE_2R2T=`fw_printenv -n force_2r2t 2> /dev/null || echo 0`
+
+	if [ "$AD936X_FORCE_2R2T" == "1" ]
+	then
+		AD936X_ATTR_NAME=compatible
+		AD936X_ATTR_VAL=ad9361
+		AD936X_COMPATIBLE=ad9361
+		AD936X_MODE=2r2t
+	fi
 
 	### /etc/udhcpd.conf ###
 	echo "start $IPADDR_HOST" > $UDHCPD_CONF
@@ -43,14 +73,7 @@ create_system_files () {
 	echo -e "\taddress $IPADDR\n""\tnetmask $NETMASK\n" >> $IFAC
 	echo -e "auto usb1\n""iface usb1 inet dhcp\n" >> $IFAC
 
-	echo -e "auto eth0" >> $IFAC
-	if [ -n "$ETH_IPADDR" ]
-	then
-		echo -e "iface eth0 inet static" >> $IFAC
-		echo -e "\taddress $ETH_IPADDR\n""\tnetmask $ETH_NETMASK\n" >> $IFAC
-	else
-		echo -e "iface eth0 inet dhcp\n" >> $IFAC
-	fi
+	echo -e "iface eth0 inet manual\n" >> $IFAC
 
 	### /etc/wpa.conf ###
 	if [ -n "$WLAN_SSID" ]
@@ -100,6 +123,18 @@ create_system_files () {
 	echo "[USB_ETHERNET]"$'\r' >> $CONF
 	echo "ipaddr_eth = $ETH_IPADDR"$'\r' >> $CONF
 	echo "netmask_eth = $ETH_NETMASK"$'\r' >> $CONF
+	echo "ipaddr_eth_fallback = $ETH_FALLBACK_IP"$'\r' >> $CONF
+	echo "ipaddr_eth_fallback_start = $ETH_FALLBACK_START"$'\r' >> $CONF
+	echo "ipaddr_eth_fallback_end = $ETH_FALLBACK_END"$'\r' >> $CONF
+	echo ""$'\r'>> $CONF
+	echo "[AD936X]"$'\r' >> $CONF
+	echo "# Extended tuning range: ad9364 uses 1r1t, ad9361 uses 2r2t"$'\r' >> $CONF
+	echo "# Pluto Plus 2R2T test override: set force_2r2t to 1 only on boards with TX2/RX2 hardware"$'\r' >> $CONF
+	echo "force_2r2t = $AD936X_FORCE_2R2T"$'\r' >> $CONF
+	echo "attr_name = $AD936X_ATTR_NAME"$'\r' >> $CONF
+	echo "attr_val = $AD936X_ATTR_VAL"$'\r' >> $CONF
+	echo "compatible = $AD936X_COMPATIBLE"$'\r' >> $CONF
+	echo "mode = $AD936X_MODE"$'\r' >> $CONF
 	echo ""$'\r'>> $CONF
 	echo "[SYSTEM]"$'\r' >> $CONF
 	echo "xo_correction = $XO_CORRECTION"$'\r' >> $CONF
@@ -112,6 +147,7 @@ create_system_files () {
 	echo "dfu = 0"$'\r' >> $CONF
 	echo "reset = 0"$'\r' >> $CONF
 	echo "calibrate = 0"$'\r' >> $CONF
+	echo "device_persistent_keys = 0"$'\r' >> $CONF
 	echo ""$'\r'>> $CONF
 
 	### /www/index.html ###
@@ -128,6 +164,12 @@ case "$1" in
 	printf "Starting network: "
 	/bin/hostname -F /etc/hostname
 	/sbin/ifup -a 2>&1 | logger
+	ETH_IPADDR="$ETH_IPADDR" \
+	ETH_FALLBACK_IP="$ETH_FALLBACK_IP" \
+	ETH_FALLBACK_NETMASK="$ETH_NETMASK" \
+	ETH_FALLBACK_START="$ETH_FALLBACK_START" \
+	ETH_FALLBACK_END="$ETH_FALLBACK_END" \
+	/usr/sbin/pluto-eth-fallback eth0 >/dev/null 2>&1 &
 	[ $? = 0 ] && echo "OK" || echo "FAIL"
 	;;
   stop)
@@ -145,4 +187,3 @@ case "$1" in
 esac
 
 exit $?
-

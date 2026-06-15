@@ -1,0 +1,100 @@
+#!/bin/sh
+
+IFACE="${1:-eth0}"
+STATIC_IP="${ETH_IPADDR:-$(fw_printenv -n ipaddr_eth 2>/dev/null || true)}"
+FALLBACK_IP="${ETH_FALLBACK_IP:-$(fw_printenv -n ipaddr_eth_fallback 2>/dev/null || echo 192.168.3.1)}"
+FALLBACK_NETMASK="${ETH_FALLBACK_NETMASK:-$(fw_printenv -n netmask_eth 2>/dev/null || echo 255.255.255.0)}"
+FALLBACK_START="${ETH_FALLBACK_START:-$(fw_printenv -n ipaddr_eth_fallback_start 2>/dev/null || echo 192.168.3.10)}"
+FALLBACK_END="${ETH_FALLBACK_END:-$(fw_printenv -n ipaddr_eth_fallback_end 2>/dev/null || echo 192.168.3.99)}"
+UDHCPD_ETH_CONF="${UDHCPD_ETH_CONF:-/etc/udhcpd-eth0.conf}"
+UDHCPD_ETH_PID="${UDHCPD_ETH_PID:-/var/run/udhcpd-eth0.pid}"
+UDHCPD_ETH_LEASES="${UDHCPD_ETH_LEASES:-/var/lib/misc/udhcpd-eth0.leases}"
+UDHCPC_ETH_PID="${UDHCPC_ETH_PID:-/var/run/udhcpc-eth0.pid}"
+
+log() {
+	logger -t pluto-eth-fallback "$*"
+}
+
+iface_exists() {
+	ip link show "$IFACE" >/dev/null 2>&1
+}
+
+current_ipv4() {
+	ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1
+}
+
+stop_eth_dhcpd() {
+	start-stop-daemon -K -q -p "$UDHCPD_ETH_PID" 2>/dev/null || true
+}
+
+stop_eth_udhcpc() {
+	start-stop-daemon -K -q -p "$UDHCPC_ETH_PID" 2>/dev/null || true
+}
+
+start_eth_dhcpd() {
+	mkdir -p "$(dirname "$UDHCPD_ETH_LEASES")"
+	touch "$UDHCPD_ETH_LEASES"
+
+	cat > "$UDHCPD_ETH_CONF" <<EOF
+start $FALLBACK_START
+end $FALLBACK_END
+interface $IFACE
+pidfile $UDHCPD_ETH_PID
+lease_file $UDHCPD_ETH_LEASES
+option subnet $FALLBACK_NETMASK
+option router $FALLBACK_IP
+option lease 86400
+EOF
+
+	if [ -s "$UDHCPD_ETH_PID" ] && kill -0 "$(cat "$UDHCPD_ETH_PID")" 2>/dev/null; then
+		return 0
+	fi
+
+	start-stop-daemon -S -q -p "$UDHCPD_ETH_PID" -x /usr/sbin/udhcpd -- "$UDHCPD_ETH_CONF" || \
+		/usr/sbin/udhcpd "$UDHCPD_ETH_CONF"
+}
+
+if ! iface_exists; then
+	log "$IFACE is not present"
+	exit 0
+fi
+
+stop_eth_dhcpd
+ip link set "$IFACE" up 2>/dev/null || ifconfig "$IFACE" up
+
+if [ -n "$STATIC_IP" ]; then
+	stop_eth_udhcpc
+	ip addr flush dev "$IFACE" 2>/dev/null || true
+	ifconfig "$IFACE" "$STATIC_IP" netmask "$FALLBACK_NETMASK" up
+	echo "$STATIC_IP" > "/opt/ipaddr-$IFACE"
+	rm -f "$UDHCPD_ETH_CONF"
+	log "$IFACE static address active: $STATIC_IP"
+	exit 0
+fi
+
+IPADDR="$(current_ipv4)"
+if [ -n "$IPADDR" ] && [ "$IPADDR" != "$FALLBACK_IP" ]; then
+	echo "$IPADDR" > "/opt/ipaddr-$IFACE"
+	rm -f "$UDHCPD_ETH_CONF"
+	log "$IFACE DHCP lease acquired: $IPADDR"
+	exit 0
+fi
+
+stop_eth_udhcpc
+ip addr flush dev "$IFACE" 2>/dev/null || true
+
+if udhcpc -i "$IFACE" -n -q -t 3 -T 2 -p "$UDHCPC_ETH_PID"; then
+	IPADDR="$(current_ipv4)"
+	if [ -n "$IPADDR" ]; then
+		echo "$IPADDR" > "/opt/ipaddr-$IFACE"
+		rm -f "$UDHCPD_ETH_CONF"
+		log "$IFACE DHCP lease acquired: $IPADDR"
+		exit 0
+	fi
+fi
+
+ip addr flush dev "$IFACE" 2>/dev/null || true
+ifconfig "$IFACE" "$FALLBACK_IP" netmask "$FALLBACK_NETMASK" up
+echo "$FALLBACK_IP" > "/opt/ipaddr-$IFACE"
+start_eth_dhcpd
+log "$IFACE DHCP fallback active at $FALLBACK_IP, serving $FALLBACK_START-$FALLBACK_END"

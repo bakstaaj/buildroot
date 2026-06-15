@@ -1,0 +1,86 @@
+#!/bin/sh
+#
+# Starts dropbear sshd and persists generated host keys to /mnt/jffs2.
+#
+
+test -r /etc/default/dropbear && . /etc/default/dropbear
+
+restore_keys() {
+	cat /proc/mounts | grep -q " /mnt/jffs2 " || return 0
+	[ -d /mnt/jffs2/etc/dropbear ] || return 0
+	[ -f /mnt/jffs2/etc/dropbear/keys.md5 ] || return 0
+
+	if cd /mnt/jffs2/etc/dropbear && md5sum -s -c keys.md5; then
+		mkdir -p /etc/dropbear
+		cp dropbear_* /etc/dropbear/
+	else
+		logger -t S50dropbear "saved Dropbear host key checksum failed"
+	fi
+}
+
+persist_keys() {
+	cat /proc/mounts | grep -q " /mnt/jffs2 " || return 0
+
+	/usr/sbin/device_persistent_keys >/dev/null 2>&1 || \
+		logger -t S50dropbear "device_persistent_keys setup failed"
+}
+
+start() {
+	DROPBEAR_ARGS="$DROPBEAR_ARGS -R"
+
+	if [ -L /etc/dropbear \
+	     -a "$(readlink /etc/dropbear)" = "/var/run/dropbear" ]
+	then
+		if rm -f /etc/dropbear >/dev/null 2>&1; then
+			mkdir -p /etc/dropbear
+		else
+			echo "No persistent location to store SSH host keys. New keys will be"
+			echo "generated at each boot. Are you sure this is what you want to do?"
+			mkdir -p "$(readlink /etc/dropbear)"
+		fi
+	fi
+
+	restore_keys
+
+	printf "Starting dropbear sshd: "
+	umask 077
+
+	start-stop-daemon -S -q -p /var/run/dropbear.pid \
+		--exec /usr/sbin/dropbear -- $DROPBEAR_ARGS
+	result=$?
+	[ $result = 0 ] && echo "OK" || echo "FAIL"
+
+	if [ $result = 0 ]; then
+		persist_keys
+	fi
+
+	return $result
+}
+
+stop() {
+	printf "Stopping dropbear sshd: "
+	start-stop-daemon -K -q -p /var/run/dropbear.pid
+	[ $? = 0 ] && echo "OK" || echo "FAIL"
+}
+
+restart() {
+	stop
+	start
+}
+
+case "$1" in
+  start)
+	start
+	;;
+  stop)
+	stop
+	;;
+  restart|reload)
+	restart
+	;;
+  *)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+
+exit $?

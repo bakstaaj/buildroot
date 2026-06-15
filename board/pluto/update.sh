@@ -189,6 +189,7 @@ process_ini() {
 	ini_parser $FILE "WLAN"
 	ini_parser $FILE "SYSTEM"
 	ini_parser $FILE "USB_ETHERNET"
+	ini_parser $FILE "AD936X"
 
 	rm -f /mnt/msd/SUCCESS_ENV_UPDATE /mnt/msd/FAILED_INVALID_UBOOT_ENV /mnt/msd/CAL_STATUS
 
@@ -196,6 +197,20 @@ process_ini() {
 	fw_printenv qspiboot
 	if [ $? -eq 0 ]; then
 		flash_indication_on
+		hostname=${hostname:-pluto}
+		attr_name=${attr_name:-compatible}
+		attr_val=${attr_val:-ad9364}
+		compatible=${compatible:-$attr_val}
+		mode=${mode:-1r1t}
+		force_2r2t=${force_2r2t:-0}
+
+		if [ "$force_2r2t" == "1" ]; then
+			attr_name=compatible
+			attr_val=ad9361
+			compatible=ad9361
+			mode=2r2t
+		fi
+
 		echo "hostname $hostname" > /opt/fw_set.tmp
 		echo "ipaddr $ipaddr" >> /opt/fw_set.tmp
 		echo "ipaddr_host $ipaddr_host" >> /opt/fw_set.tmp
@@ -208,6 +223,14 @@ process_ini() {
 		echo "usb_ethernet_mode $usb_ethernet_mode" >> /opt/fw_set.tmp
 		echo "ipaddr_eth $ipaddr_eth" >> /opt/fw_set.tmp
 		echo "netmask_eth $netmask_eth" >> /opt/fw_set.tmp
+		echo "ipaddr_eth_fallback $ipaddr_eth_fallback" >> /opt/fw_set.tmp
+		echo "ipaddr_eth_fallback_start $ipaddr_eth_fallback_start" >> /opt/fw_set.tmp
+		echo "ipaddr_eth_fallback_end $ipaddr_eth_fallback_end" >> /opt/fw_set.tmp
+		echo "attr_name $attr_name" >> /opt/fw_set.tmp
+		echo "attr_val $attr_val" >> /opt/fw_set.tmp
+		echo "compatible $compatible" >> /opt/fw_set.tmp
+		echo "mode $mode" >> /opt/fw_set.tmp
+		echo "force_2r2t $force_2r2t" >> /opt/fw_set.tmp
 		fw_setenv -s /opt/fw_set.tmp
 		rm /opt/fw_set.tmp
 		flash_indication_off
@@ -236,6 +259,18 @@ process_ini() {
 	if [ "$calibrate" -gt "70000000" ]
 	then
 		calibrate $calibrate > /mnt/msd/CAL_STATUS
+	fi
+
+	if [ "${device_persistent_keys:-0}" == "1" ] || [ "${persistent_keys:-0}" == "1" ]
+	then
+		if /usr/sbin/device_persistent_keys > /mnt/msd/PERSISTENT_KEYS_STATUS 2>&1
+		then
+			echo "device_persistent_keys completed" >> /mnt/msd/PERSISTENT_KEYS_STATUS
+		else
+			echo "device_persistent_keys failed" >> /mnt/msd/PERSISTENT_KEYS_STATUS
+		fi
+		sed -i -e "s/^device_persistent_keys[[:space:]]*=.*$/device_persistent_keys = 0/" $conf
+		sed -i -e "/^persistent_keys[[:space:]]*=.*$/d" $conf
 	fi
 
 	echo here_1: > /mnt/msd/status

@@ -1,19 +1,45 @@
 #!/bin/sh
 set +e
 
-KEYFILE=/etc/dropbear/dropbear_ecdsa_host_key
 IDFILE=/root/.ssh/authorized_keys
 
-cat /proc/mounts | grep -q mtd2 || (echo "Filesystem not mounted use device_format_jffs2 command to setup your partition"; exit 1)
+cat /proc/mounts | grep -q " /mnt/jffs2 " || {
+	echo "Filesystem not mounted; use device_format_jffs2 command to setup your partition"
+	exit 1
+}
 
-#dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key
-[[ ! -f ${KEYFILE} ]] && dropbearkey -t ecdsa -f ${KEYFILE}
-install -D /etc/dropbear/dropbear_* -t /mnt/jffs2/etc/dropbear
+if [ -L /etc/dropbear ]; then
+	rm -f /etc/dropbear
+fi
+mkdir -p /etc/dropbear
+
+generate_key() {
+	key_type="$1"
+	key_file="$2"
+
+	if [ ! -f "$key_file" ]; then
+		dropbearkey -t "$key_type" -f "$key_file" || rm -f "$key_file"
+	fi
+}
+
+generate_key rsa /etc/dropbear/dropbear_rsa_host_key
+generate_key ecdsa /etc/dropbear/dropbear_ecdsa_host_key
+generate_key ed25519 /etc/dropbear/dropbear_ed25519_host_key
+
+mkdir -p /mnt/jffs2/etc/dropbear
+cp /etc/dropbear/dropbear_* /mnt/jffs2/etc/dropbear/
 cd /etc/dropbear
-md5sum dropbear_* /etc/dropbear/ 2>/dev/null > /mnt/jffs2/etc/dropbear/keys.md5
+md5sum dropbear_* 2>/dev/null > /mnt/jffs2/etc/dropbear/keys.md5
+
+echo "Saved Dropbear host keys:"
+for key_file in dropbear_*_host_key; do
+	[ -f "$key_file" ] || continue
+	dropbearkey -y -f "$key_file" 2>/dev/null | sed "s/^/$(basename "$key_file"): /"
+done
 
 if [ -f ${IDFILE} ]; then
- install -D ${IDFILE} -t /mnt/jffs2/root/.ssh
+ mkdir -p /mnt/jffs2/root/.ssh
+ cp ${IDFILE} /mnt/jffs2/root/.ssh/
  cd /root/.ssh
  md5sum authorized_keys 2>/dev/null > /mnt/jffs2/root/.ssh/keys.md5
 fi

@@ -16,11 +16,21 @@ do_mount()
 {
 	local errno
 	local err
+	local opts
 
 	errno=0
+	case "$1" in
+		mmcblk*)
+			opts=noatime
+			;;
+		*)
+			opts=sync
+			;;
+	esac
+
 	for I in $(seq 5)
 	do
-		err=$(mount -t auto -o sync "/dev/$1" "${destdir}/$1" 2>&1)
+		err=$(mount -t auto -o "${opts}" "/dev/$1" "${destdir}/$1" 2>&1)
 		errno=$?
 
 		# If we get a "Device or resource busy" error, retry again in a
