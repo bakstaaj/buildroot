@@ -203,6 +203,7 @@ process_ini() {
 		compatible=${compatible:-$attr_val}
 		mode=${mode:-1r1t}
 		force_2r2t=${force_2r2t:-0}
+		macaddr_eth=${macaddr_eth:-00:0a:35:00:01:22}
 
 		if [ "$force_2r2t" == "1" ]; then
 			attr_name=compatible
@@ -226,6 +227,7 @@ process_ini() {
 		echo "ipaddr_eth_fallback $ipaddr_eth_fallback" >> /opt/fw_set.tmp
 		echo "ipaddr_eth_fallback_start $ipaddr_eth_fallback_start" >> /opt/fw_set.tmp
 		echo "ipaddr_eth_fallback_end $ipaddr_eth_fallback_end" >> /opt/fw_set.tmp
+		echo "macaddr_eth $macaddr_eth" >> /opt/fw_set.tmp
 		echo "attr_name $attr_name" >> /opt/fw_set.tmp
 		echo "attr_val $attr_val" >> /opt/fw_set.tmp
 		echo "compatible $compatible" >> /opt/fw_set.tmp

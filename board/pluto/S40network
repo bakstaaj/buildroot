@@ -38,6 +38,7 @@ create_system_files () {
 	ETH_FALLBACK_IP=`fw_printenv -n ipaddr_eth_fallback 2> /dev/null || echo 192.168.3.1`
 	ETH_FALLBACK_START=`fw_printenv -n ipaddr_eth_fallback_start 2> /dev/null || echo 192.168.3.10`
 	ETH_FALLBACK_END=`fw_printenv -n ipaddr_eth_fallback_end 2> /dev/null || echo 192.168.3.99`
+	ETH_MACADDR=`fw_printenv -n macaddr_eth 2> /dev/null || fw_printenv -n ethaddr 2> /dev/null || echo 00:0a:35:00:01:22`
 
 	WLAN_SSID=`fw_printenv -n ssid_wlan 2> /dev/null`
 	WLAN_PWD=`fw_printenv -n pwd_wlan 2> /dev/null`
@@ -126,6 +127,7 @@ create_system_files () {
 	echo "ipaddr_eth_fallback = $ETH_FALLBACK_IP"$'\r' >> $CONF
 	echo "ipaddr_eth_fallback_start = $ETH_FALLBACK_START"$'\r' >> $CONF
 	echo "ipaddr_eth_fallback_end = $ETH_FALLBACK_END"$'\r' >> $CONF
+	echo "macaddr_eth = $ETH_MACADDR"$'\r' >> $CONF
 	echo ""$'\r'>> $CONF
 	echo "[AD936X]"$'\r' >> $CONF
 	echo "# Extended tuning range: ad9364 uses 1r1t, ad9361 uses 2r2t"$'\r' >> $CONF
@@ -156,11 +158,25 @@ create_system_files () {
 
 	}
 
+set_eth_macaddr () {
+	case "$ETH_MACADDR" in
+		[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F])
+			/sbin/ifconfig eth0 down 2>/dev/null
+			/sbin/ifconfig eth0 hw ether "$ETH_MACADDR"
+			;;
+		*)
+			logger -t S40network "Ignoring invalid eth0 MAC address: $ETH_MACADDR"
+			return 1
+			;;
+	esac
+}
+
 mkdir -p /run/network
 
 case "$1" in
   start)
 	create_system_files
+	set_eth_macaddr
 	printf "Starting network: "
 	/bin/hostname -F /etc/hostname
 	/sbin/ifup -a 2>&1 | logger

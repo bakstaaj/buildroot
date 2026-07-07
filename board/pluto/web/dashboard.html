@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PlutoSDR Dashboard</title>
+<link rel="shortcut icon" href="img/favicon.ico" type="image/x-icon">
+<link rel="stylesheet" href="img/pluto-dashboard.css">
+</head>
+<body>
+<header class="topbar">
+	<div>
+		<h1>PlutoSDR Dashboard</h1>
+		<p id="versionLine">Loading firmware state...</p>
+	</div>
+	<nav>
+		<a href="index.html">Info</a>
+		<a href="dashboard.html" aria-current="page">Dashboard</a>
+	</nav>
+</header>
+
+<main>
+	<section class="band">
+		<div class="section-head">
+			<h2>System</h2>
+			<span id="refreshState">Waiting</span>
+		</div>
+		<div class="metric-grid" id="systemMetrics"></div>
+	</section>
+
+	<section class="band">
+		<div class="section-head">
+			<h2>Radio</h2>
+			<span id="radioState">AD9361</span>
+		</div>
+		<div class="metric-grid" id="radioMetrics"></div>
+	</section>
+
+	<section class="band">
+		<div class="section-head">
+			<h2>Network</h2>
+			<span>USB gadget and Ethernet</span>
+		</div>
+		<div class="metric-grid" id="networkMetrics"></div>
+	</section>
+
+	<section class="band controls">
+		<div class="section-head">
+			<h2>Persistent Settings</h2>
+			<span id="settingsState">Stored on /mnt/jffs2</span>
+		</div>
+		<form id="settingsForm"></form>
+		<div class="actions">
+			<button type="button" id="reloadSettings">Reload</button>
+			<button type="submit" form="settingsForm">Save and Apply</button>
+		</div>
+	</section>
+
+	<section class="band files">
+		<div class="section-head">
+			<h2>File Browser</h2>
+			<span id="filesState">Read-only</span>
+		</div>
+		<div class="file-toolbar">
+			<select id="fileRoot">
+				<option value="jffs2">/mnt/jffs2</option>
+				<option value="media">/media</option>
+				<option value="opt">/opt</option>
+				<option value="logs">/var/log</option>
+				<option value="web">/www</option>
+			</select>
+			<button type="button" id="fileUp">Up</button>
+			<button type="button" id="fileRefresh">Refresh</button>
+		</div>
+		<div class="pathline" id="filePath">/mnt/jffs2</div>
+		<div class="file-grid" id="fileList"></div>
+		<pre id="filePreview"></pre>
+	</section>
+</main>
+
+<script src="img/pluto-dashboard.js"></script>
+</body>
+</html>

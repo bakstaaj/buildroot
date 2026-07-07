@@ -1,0 +1,65 @@
+#!/bin/sh
+
+SETTINGS_FILE=/mnt/jffs2/pluto-web/settings.conf
+
+find_iio_device() {
+	for dev in /sys/bus/iio/devices/iio:device*; do
+		[ -r "$dev/name" ] || continue
+		[ "$(cat "$dev/name" 2>/dev/null)" = "$1" ] && {
+			echo "$dev"
+			return 0
+		}
+	done
+	return 1
+}
+
+is_safe_value() {
+	case "$1" in
+		""|*[!A-Za-z0-9_.+-]*)
+			return 1
+			;;
+	esac
+	return 0
+}
+
+load_settings() {
+	[ -r "$SETTINGS_FILE" ] || return 0
+	while IFS='=' read -r key value; do
+		case "$key" in
+			rx_lo_hz|tx_lo_hz|rx_sample_rate_hz|tx_sample_rate_hz|rx_rf_bandwidth_hz|tx_rf_bandwidth_hz|rx_gain_control_mode|rx_hardwaregain_db|tx_hardwaregain_db|ensm_mode)
+				is_safe_value "$value" || continue
+				eval "$key=\$value"
+				;;
+		esac
+	done < "$SETTINGS_FILE"
+}
+
+write_attr() {
+	path=$1
+	value=$2
+	[ -n "$value" ] || return 0
+	[ -w "$path" ] || return 0
+	echo "$value" > "$path" 2>/dev/null || return 1
+	return 0
+}
+
+apply_phy_settings() {
+	phy=$(find_iio_device ad9361-phy) || return 0
+
+	write_attr "$phy/out_altvoltage0_RX_LO_frequency" "$rx_lo_hz"
+	write_attr "$phy/out_altvoltage1_TX_LO_frequency" "$tx_lo_hz"
+	write_attr "$phy/in_voltage_rf_bandwidth" "$rx_rf_bandwidth_hz"
+	write_attr "$phy/out_voltage_rf_bandwidth" "$tx_rf_bandwidth_hz"
+	write_attr "$phy/in_voltage_sampling_frequency" "$rx_sample_rate_hz"
+	write_attr "$phy/out_voltage_sampling_frequency" "$tx_sample_rate_hz"
+	write_attr "$phy/in_voltage0_gain_control_mode" "$rx_gain_control_mode"
+	write_attr "$phy/in_voltage1_gain_control_mode" "$rx_gain_control_mode"
+	write_attr "$phy/in_voltage0_hardwaregain" "$rx_hardwaregain_db"
+	write_attr "$phy/in_voltage1_hardwaregain" "$rx_hardwaregain_db"
+	write_attr "$phy/out_voltage0_hardwaregain" "$tx_hardwaregain_db"
+	write_attr "$phy/out_voltage1_hardwaregain" "$tx_hardwaregain_db"
+	write_attr "$phy/ensm_mode" "$ensm_mode"
+}
+
+load_settings
+apply_phy_settings

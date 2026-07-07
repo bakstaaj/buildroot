@@ -21,7 +21,8 @@ do_mount()
 	errno=0
 	case "$1" in
 		mmcblk*)
-			opts=noatime
+			/usr/sbin/pluto-sdcard-prepare "$1"
+			return $?
 			;;
 		*)
 			opts=sync

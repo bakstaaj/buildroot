@@ -1,0 +1,4 @@
+# sha256 from https://pypi.org/pypi/sgp4/2.24/json
+sha256  5655249f276ea23fbdae9e881ab01d82420285b45dc76d0da4f424e3647f8352  sgp4-2.24.tar.gz
+# Locally computed sha256 checksums
+sha256  e111b0a42316a3588d2d9db88b4ad63dc7abaae87d3f873162ca2c3a0417208c  LICENSE

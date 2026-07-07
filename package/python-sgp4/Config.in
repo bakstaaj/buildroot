@@ -1,0 +1,7 @@
+config BR2_PACKAGE_PYTHON_SGP4
+	bool "python-sgp4"
+	help
+	  Track Earth satellite positions from TLE orbital elements using
+	  the SGP4/SDP4 propagation algorithms.
+
+	  https://github.com/brandon-rhodes/python-sgp4

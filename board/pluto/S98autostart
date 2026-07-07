@@ -5,9 +5,20 @@
 
 case "$1" in
   start)
-	if test -f /mnt/jffs2/autorun.sh; then
-		source /mnt/jffs2/autorun.sh
-	fi
+	(
+		if ! /usr/sbin/pluto-sdcard-prepare --all; then
+			logger -t S98autostart "SD card preparation failed; not running autorun.sh"
+			exit 1
+		fi
+
+		if test -x /usr/sbin/pluto-web-apply-settings; then
+			/usr/sbin/pluto-web-apply-settings
+		fi
+
+		if test -f /mnt/jffs2/autorun.sh; then
+			. /mnt/jffs2/autorun.sh
+		fi
+	) &
 	;;
   stop)
 	;;
