@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Small IQ-to-PCM audio backend for Pluto radio profiles.
+
+This is intentionally dependency-free. It is a first firmware-side DSP backend
+that can be replaced later by an optimized C/liquid-dsp implementation without
+changing the application-facing radio API contract.
+"""
+
+import math
+import os
+from pathlib import Path
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+
+DEFAULT_IIO_READDEV = "/usr/bin/iio_readdev"
+DEFAULT_IIO_DEVICE = "cf-ad9361-lpc"
+DEFAULT_IIO_CHANNELS = "voltage0 voltage1"
+DEFAULT_IN_RATE_HZ = 600000
+DEFAULT_AUDIO_RATE_HZ = 12000
+MAX_CHUNK_SAMPLES = 8192
+INT16_MAX = 32767
+INT16_MIN = -32768
+
+
+running = True
+
+
+def stop(_signum, _frame):
+    global running
+    running = False
+
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+
+
+def int_env(name, default, minimum=None, maximum=None):
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        value = default
+    else:
+        try:
+            value = int(float(raw))
+        except ValueError:
+            value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def clamp16(value):
+    if value > INT16_MAX:
+        return INT16_MAX
+    if value < INT16_MIN:
+        return INT16_MIN
+    return int(value)
+
+
+def open_audio_sink(path):
+    target = Path(path)
+    try:
+        mode = target.stat().st_mode
+    except FileNotFoundError:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        return target.open("wb")
+    if stat.S_ISFIFO(mode):
+        return target.open("wb", buffering=0)
+    return target.open("wb")
+
+
+def synthetic_iq(sample_rate_hz, max_seconds, chunk_samples):
+    phase = 0.0
+    tone_hz = float(int_env("PLUTO_DSP_TEST_TONE_HZ", 1200, 20, 12000))
+    step = (2.0 * math.pi * tone_hz) / sample_rate_hz
+    end_at = time.monotonic() + max_seconds if max_seconds else None
+    while running and (end_at is None or time.monotonic() < end_at):
+        out = bytearray()
+        for _ in range(chunk_samples):
+            amp = 16000
+            i_val = int(math.cos(phase) * amp)
+            q_val = int(math.sin(phase) * amp)
+            out.extend(struct.pack("<hh", i_val, q_val))
+            phase += step
+            if phase > math.pi:
+                phase -= 2.0 * math.pi
+        yield bytes(out)
+
+
+def stdin_iq(chunk_bytes, max_seconds):
+    source = sys.stdin.buffer
+    end_at = time.monotonic() + max_seconds if max_seconds else None
+    while running and (end_at is None or time.monotonic() < end_at):
+        data = source.read(chunk_bytes)
+        if not data:
+            break
+        yield data
+
+
+def iio_iq(chunk_samples):
+    readdev = os.environ.get("PLUTO_IIO_READDEV", DEFAULT_IIO_READDEV)
+    device = os.environ.get("PLUTO_IIO_DEVICE", DEFAULT_IIO_DEVICE)
+    channels = os.environ.get("PLUTO_IIO_CHANNELS", DEFAULT_IIO_CHANNELS).split()
+    buffer_count = str(int_env("PLUTO_IIO_BUFFER_SAMPLES", chunk_samples, 128, 65536))
+    cmd = [readdev, "-b", buffer_count, device] + channels
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        assert proc.stdout is not None
+        while running:
+            data = proc.stdout.read(chunk_samples * 4)
+            if not data:
+                break
+            yield data
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+class DspState:
+    def __init__(self, demod, input_rate_hz, audio_rate_hz, cw_bfo_hz):
+        self.demod = demod
+        self.input_rate_hz = input_rate_hz
+        self.audio_rate_hz = audio_rate_hz
+        self.decim = max(1, int(round(float(input_rate_hz) / audio_rate_hz)))
+        self.prev_i = 1
+        self.prev_q = 0
+        self.am_avg = 1.0
+        self.lp = 0.0
+        self.acc = 0.0
+        self.count = 0
+        self.cw_phase = 0.0
+        self.cw_step = (2.0 * math.pi * cw_bfo_hz) / audio_rate_hz
+        if demod == "wfm":
+            self.scale = 5200.0
+            self.alpha = 0.22
+        elif demod == "am":
+            self.scale = 0.22
+            self.alpha = 0.08
+        elif demod == "cw":
+            self.scale = 1.35
+            self.alpha = 0.05
+        else:
+            self.scale = 10500.0
+            self.alpha = 0.16
+
+
+def iq_to_pcm(data, state):
+    data = data[: len(data) - (len(data) % 4)]
+    pcm = bytearray()
+    for i_val, q_val in struct.iter_unpack("<hh", data):
+        if state.demod in {"nfm", "wfm"}:
+            cross = float(i_val * state.prev_q - q_val * state.prev_i)
+            dot = float(i_val * state.prev_i + q_val * state.prev_q) + 1.0
+            sample = math.atan2(cross, dot) * state.scale
+            state.prev_i = i_val
+            state.prev_q = q_val
+        else:
+            mag = math.sqrt(float(i_val * i_val + q_val * q_val))
+            state.am_avg += (mag - state.am_avg) * 0.002
+            if state.demod == "cw":
+                sample = max(0.0, mag - state.am_avg * 0.72) * state.scale
+            else:
+                sample = (mag - state.am_avg) * state.scale
+
+        state.lp += (sample - state.lp) * state.alpha
+        state.acc += state.lp
+        state.count += 1
+        if state.count < state.decim:
+            continue
+
+        audio = state.acc / state.count
+        state.acc = 0.0
+        state.count = 0
+        if state.demod == "cw":
+            audio = audio * math.sin(state.cw_phase)
+            state.cw_phase += state.cw_step
+            if state.cw_phase > math.pi:
+                state.cw_phase -= 2.0 * math.pi
+        pcm.extend(struct.pack("<h", clamp16(audio)))
+    return bytes(pcm)
+
+
+def iq_chunks(source, input_rate_hz, max_seconds, chunk_samples):
+    chunk_bytes = chunk_samples * 4
+    if source == "synthetic":
+        return synthetic_iq(input_rate_hz, max_seconds, chunk_samples)
+    if source == "stdin":
+        return stdin_iq(chunk_bytes, max_seconds)
+    return iio_iq(chunk_samples)
+
+
+def main():
+    fifo = os.environ.get("PLUTO_AUDIO_FIFO")
+    if not fifo:
+        print("PLUTO_AUDIO_FIFO is required", file=sys.stderr)
+        return 2
+
+    demod = os.environ.get("PLUTO_AUDIO_DEMOD", "nfm").lower()
+    if demod not in {"nfm", "wfm", "am", "cw"}:
+        demod = "nfm"
+    audio_rate_hz = int_env("PLUTO_AUDIO_RATE_HZ", DEFAULT_AUDIO_RATE_HZ, 4000, 48000)
+    input_rate_hz = int_env("PLUTO_DSP_INPUT_RATE_HZ", DEFAULT_IN_RATE_HZ, audio_rate_hz, 5000000)
+    cw_bfo_hz = int_env("PLUTO_AUDIO_CW_BFO_HZ", 700, 100, 3000)
+    chunk_samples = int_env("PLUTO_DSP_MAX_CHUNK_SAMPLES", MAX_CHUNK_SAMPLES, 256, 32768)
+    max_seconds = int_env("PLUTO_AUDIO_TEST_SECONDS", 0, 0, 3600)
+    source = os.environ.get("PLUTO_AUDIO_SOURCE", "iio").lower()
+
+    state = DspState(demod, input_rate_hz, audio_rate_hz, cw_bfo_hz)
+    with open_audio_sink(fifo) as sink:
+        for chunk in iq_chunks(source, input_rate_hz, max_seconds, chunk_samples):
+            pcm = iq_to_pcm(chunk, state)
+            if pcm:
+                sink.write(pcm)
+        try:
+            sink.flush()
+        except BrokenPipeError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

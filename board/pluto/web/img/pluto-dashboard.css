@@ -125,13 +125,19 @@ label {
 }
 
 input,
-select {
+select,
+textarea {
 	width: 100%;
 	border: 1px solid #b8c5d0;
 	border-radius: 4px;
 	padding: 8px;
 	font: inherit;
 	background: #fff;
+}
+
+textarea {
+	font-family: Consolas, monospace;
+	resize: vertical;
 }
 
 .hint {
@@ -235,6 +241,73 @@ button:first-child {
 	background: #66788a;
 }
 
+code {
+	background: #eef3f7;
+	border-radius: 3px;
+	padding: 1px 4px;
+}
+
+.api-docs p {
+	margin-top: 0;
+}
+
+.api-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+	gap: 12px;
+}
+
+.api-grid h3 {
+	font-size: 15px;
+	margin: 0 0 6px;
+}
+
+.api-grid pre,
+.api-response {
+	background: #17212b;
+	border-radius: 5px;
+	color: #e9f0f6;
+	margin: 0;
+	overflow: auto;
+	padding: 12px;
+}
+
+.api-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 10px;
+}
+
+.api-form .api-wide {
+	grid-column: 1 / -1;
+}
+
+.api-response {
+	min-height: 180px;
+	white-space: pre-wrap;
+}
+
+.checkline {
+	align-items: flex-start;
+	display: flex;
+	font-weight: 400;
+	gap: 8px;
+	margin-bottom: 12px;
+}
+
+.checkline input {
+	margin-top: 3px;
+	width: auto;
+}
+
+.tx-danger {
+	border-color: #e0b3b3;
+}
+
+.tx-danger h2 {
+	color: #8a2b2b;
+}
+
 @media (max-width: 620px) {
 	.topbar {
 		align-items: flex-start;
@@ -251,5 +324,9 @@ button:first-child {
 	.actions button {
 		flex: 1;
 		text-align: center;
+	}
+
+	.api-actions button {
+		flex: 1 1 45%;
 	}
 }

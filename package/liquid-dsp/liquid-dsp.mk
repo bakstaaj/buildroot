@@ -33,6 +33,10 @@ endif
 ifeq ($(BR2_PACKAGE_FFTW_SINGLE),y)
 LIQUID_DSP_LDFLAGS += -lfftw3f
 LIQUID_DSP_DEPENDENCIES += fftw-single
+else
+LIQUID_DSP_CONF_ENV += \
+	ac_cv_header_fftw3_h=no \
+	ac_cv_lib_fftw3f_fftwf_plan_dft_1d=no
 endif
 
 # disable altivec, it has build issues

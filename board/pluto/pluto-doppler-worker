@@ -1,0 +1,32 @@
+#!/bin/sh
+
+API=/usr/sbin/pluto-radio-api
+STATE=/var/run/pluto-radio/doppler.json
+MIN_SLEEP=1
+
+running=1
+trap 'running=0' TERM INT
+
+interval_seconds() {
+	[ -r "$STATE" ] || {
+		echo "$MIN_SLEEP"
+		return
+	}
+	python3 - "$STATE" <<'PY'
+import json
+import sys
+try:
+    data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+    ms = int(data.get("plan", {}).get("retune_interval_ms", 1000))
+except Exception:
+    ms = 1000
+print(max(1, ms // 1000))
+PY
+}
+
+while [ "$running" = 1 ]; do
+	"$API" doppler-tick >/dev/null 2>&1 || true
+	sleep "$(interval_seconds)"
+done
+
+exit 0

@@ -1,0 +1,41 @@
+#!/bin/sh
+
+API=/usr/sbin/pluto-radio-api
+STATE_DIR=/var/run/pluto-radio
+
+case "$1" in
+	start)
+		printf "Preparing Pluto radio API: "
+		mkdir -p "$STATE_DIR"
+		if [ -x "$API" ]; then
+			if "$API" profiles > "$STATE_DIR/profile-check.json" 2> "$STATE_DIR/profile-check.err"; then
+				echo "OK"
+			else
+				echo "FAIL"
+			fi
+		else
+			echo "missing"
+		fi
+		;;
+	stop)
+		printf "Stopping Pluto radio API: "
+		[ -x "$API" ] && "$API" stop >/dev/null 2>&1
+		echo "OK"
+		;;
+	status)
+		[ -x "$API" ] && "$API" watchdog-status
+		;;
+	check)
+		[ -x "$API" ] && "$API" watchdog-check
+		;;
+	restart|reload)
+		"$0" stop
+		"$0" start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|status|check|restart|reload}"
+		exit 1
+		;;
+esac
+
+exit 0

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pluto Radio API Test</title>
+<link rel="shortcut icon" href="img/favicon.ico" type="image/x-icon">
+<link rel="stylesheet" href="img/pluto-dashboard.css">
+</head>
+<body>
+<header class="topbar">
+	<div>
+		<h1>Pluto Radio API</h1>
+		<p id="apiState">App-builder documentation and live endpoint tests</p>
+	</div>
+	<nav>
+		<a href="index.html">Info</a>
+		<a href="dashboard.html">Dashboard</a>
+		<a href="api-test.html" aria-current="page">API Test</a>
+	</nav>
+</header>
+
+<main>
+	<section class="band">
+		<div class="section-head">
+			<h2>Quick Status</h2>
+			<span id="lastRun">Not run</span>
+		</div>
+		<div class="metric-grid" id="quickMetrics"></div>
+	</section>
+
+	<section class="band api-docs">
+		<div class="section-head">
+			<h2>API Contract</h2>
+			<span>CGI entrypoint: /cgi-bin/pluto-radio-api</span>
+		</div>
+		<p>Use the <code>path</code> query parameter for logical routes. POST requests use JSON bodies and all responses are JSON.</p>
+		<p>TX modes are <code>tone</code>, <code>carrier</code>, <code>am</code>, <code>fm</code>, and <code>cw</code>. AM/FM can use a built-in test tone or app-provided signed 16-bit mono PCM from a safe file/FIFO path.</p>
+		<div class="api-grid">
+			<div>
+				<h3>Status and Control</h3>
+				<pre>GET  /system/health
+GET  /radio/status
+GET  /radio/profile/list
+POST /radio/profile/apply
+POST /radio/tune
+POST /radio/stop</pre>
+			</div>
+			<div>
+				<h3>Audio and Spectrum</h3>
+				<pre>POST /radio/audio/start
+POST /radio/audio/stop
+GET  /radio/audio/status
+GET  /radio/audio/live.wav
+POST /radio/spectrum/snapshot
+POST /radio/spectrum/top</pre>
+			</div>
+			<div>
+				<h3>Diagnostics and TX</h3>
+				<pre>POST /radio/loopback/start
+GET  /radio/loopback/status
+GET  /radio/tx/guardrails
+POST /radio/tx/guardrails
+POST /radio/tx/start
+POST /radio/tx/stop
+GET  /radio/tx/status</pre>
+			</div>
+			<div>
+				<h3>Calibration and Self Test</h3>
+				<pre>GET  /radio/calibration/status
+POST /radio/calibration/apply
+POST /system/self-test
+GET  /system/self-test/status</pre>
+			</div>
+			<div>
+				<h3>Doppler</h3>
+				<pre>POST /radio/doppler/plan
+POST /radio/doppler/start
+POST /radio/doppler/tick
+POST /radio/doppler/stop
+GET  /radio/doppler/status</pre>
+			</div>
+		</div>
+	</section>
+
+	<section class="band">
+		<div class="section-head">
+			<h2>Safe Tests</h2>
+			<span>Simulation unless noted</span>
+		</div>
+		<div class="api-actions" id="safeTests"></div>
+	</section>
+
+	<section class="band controls">
+		<div class="section-head">
+			<h2>Custom Request</h2>
+			<span>Advanced app-builder console</span>
+		</div>
+		<form id="customForm" class="api-form">
+			<div>
+				<label for="method">Method</label>
+				<select id="method" name="method">
+					<option>GET</option>
+					<option>POST</option>
+				</select>
+			</div>
+			<div>
+				<label for="path">Path</label>
+				<input id="path" name="path" value="/system/health">
+			</div>
+			<div class="api-wide">
+				<label for="payload">JSON Payload</label>
+				<textarea id="payload" name="payload" rows="8">{}</textarea>
+				<div class="hint">POST bodies are sent as application/json.</div>
+			</div>
+		</form>
+		<div class="actions">
+			<button type="button" id="runCustom">Run Request</button>
+		</div>
+	</section>
+
+	<section class="band tx-danger">
+		<div class="section-head">
+			<h2>Live TX Guard</h2>
+			<span>Use only with a controlled RF setup</span>
+		</div>
+		<label class="checkline">
+			<input type="checkbox" id="liveTxConfirm">
+			I understand this emits live RF and I am using a dummy load, shielding, or a legal test frequency.
+		</label>
+		<div class="api-actions">
+			<button type="button" id="runLiveTx">Run 2s Live TX Test</button>
+			<button type="button" id="stopTx">Stop TX</button>
+		</div>
+	</section>
+
+	<section class="band">
+		<div class="section-head">
+			<h2>Response</h2>
+			<span id="responseState">Waiting</span>
+		</div>
+		<pre id="apiResponse" class="api-response">{}</pre>
+	</section>
+</main>
+
+<script src="img/pluto-api-test.js"></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+{
+  "name": "FM_BROADCAST_WFM",
+  "label": "FM broadcast wideband audio",
+  "description": "Wideband FM broadcast listening and antenna sanity checks.",
+  "default_frequency_hz": 100100000,
+  "sample_rate_hz": 2400000,
+  "rf_bandwidth_hz": 1500000,
+  "gain_control_mode": "slow_attack",
+  "gain_db": 40,
+  "demod_mode": "wfm",
+  "audio_rate_hz": 48000,
+  "filter_width_hz": 180000,
+  "squelch_db": -60,
+  "deemphasis": "75us",
+  "agc": "slow_attack",
+  "output_gain": 1.0,
+  "noise_gate_db": -120,
+  "dc_block": true,
+  "stream_format": "pcm_s16le",
+  "tx_allowed": false
+}

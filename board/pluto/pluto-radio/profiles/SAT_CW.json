@@ -1,0 +1,22 @@
+{
+  "name": "SAT_CW",
+  "label": "Satellite CW monitor",
+  "description": "CW carrier monitoring with a browser-friendly audio tone target.",
+  "default_frequency_hz": 145800000,
+  "sample_rate_hz": 600000,
+  "rf_bandwidth_hz": 200000,
+  "gain_control_mode": "manual",
+  "gain_db": 40,
+  "demod_mode": "cw",
+  "audio_rate_hz": 48000,
+  "filter_width_hz": 2500,
+  "cw_bfo_hz": 700,
+  "squelch_db": -70,
+  "deemphasis": "none",
+  "agc": "manual",
+  "output_gain": 1.0,
+  "noise_gate_db": -95,
+  "dc_block": true,
+  "stream_format": "pcm_s16le",
+  "tx_allowed": false
+}

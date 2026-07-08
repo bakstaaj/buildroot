@@ -1,0 +1,21 @@
+{
+  "name": "IQ_CAPTURE",
+  "label": "IQ capture",
+  "description": "Raw IQ capture profile for repeatable development and diagnostics.",
+  "default_frequency_hz": 145800000,
+  "sample_rate_hz": 1000000,
+  "rf_bandwidth_hz": 1000000,
+  "gain_control_mode": "manual",
+  "gain_db": 35,
+  "demod_mode": "iq",
+  "audio_rate_hz": 0,
+  "filter_width_hz": 0,
+  "squelch_db": -120,
+  "deemphasis": "none",
+  "agc": "manual",
+  "output_gain": 1.0,
+  "noise_gate_db": -120,
+  "dc_block": true,
+  "stream_format": "sc16_iq",
+  "tx_allowed": false
+}

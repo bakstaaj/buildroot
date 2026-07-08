@@ -1,0 +1,2709 @@
+#!/usr/bin/env python3
+"""Small firmware-side radio profile/control API for Pluto/Pluto+."""
+
+import json
+import os
+import re
+import shutil
+import socket
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import parse_qs
+
+
+DEFAULT_PROFILE_DIRS = (
+    Path("/mnt/jffs2/pluto-radio/profiles"),
+    Path("/etc/pluto-radio/profiles"),
+)
+STATE_DIR = Path("/var/run/pluto-radio")
+STATE_FILE = STATE_DIR / "state.json"
+AUDIO_STATE_FILE = STATE_DIR / "audio.json"
+WATCHDOG_STATE_FILE = STATE_DIR / "watchdog.json"
+SPECTRUM_STATE_FILE = STATE_DIR / "spectrum.json"
+DOPPLER_STATE_FILE = STATE_DIR / "doppler.json"
+LOOPBACK_STATE_FILE = STATE_DIR / "loopback.json"
+TX_STATE_FILE = STATE_DIR / "tx.json"
+CALIBRATION_STATE_FILE = STATE_DIR / "calibration.json"
+SELF_TEST_STATE_FILE = STATE_DIR / "self-test.json"
+AUDIO_FIFO = STATE_DIR / "audio.pcm"
+DEFAULT_CAPTURE_DIR = Path("/mnt/jffs2/pluto-captures")
+CAPTURE_BACKEND = Path("/usr/sbin/pluto-capture-backend")
+SPECTRUM_BACKEND = Path("/usr/sbin/pluto-spectrum-backend")
+LOOPBACK_BACKEND = Path("/usr/sbin/pluto-loopback-backend")
+TX_BACKEND = Path("/usr/sbin/pluto-tx-backend")
+DEFAULT_AUDIO_BACKEND = Path("/usr/sbin/pluto-audio-backend")
+SIM_AUDIO_BACKEND = Path("/usr/sbin/pluto-audio-sim-backend")
+DOPPLER_WORKER = Path("/usr/sbin/pluto-doppler-worker")
+RADIO_NAME = "ad9361-phy"
+PROFILE_RE = re.compile(r"^[A-Z0-9_.-]+$")
+CAPTURE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+GAIN_MODES = {"manual", "slow_attack", "fast_attack", "hybrid"}
+AUDIO_DEMODES = {"nfm", "wfm", "am", "cw"}
+AUDIO_AGC_MODES = {"manual", "off", "slow_attack", "fast_attack", "normalize"}
+DEEMPHASIS_MODES = {"none", "50us", "75us"}
+TX_MODES = {"tone", "carrier", "am", "fm", "cw"}
+TX_AUDIO_SOURCES = {"tone", "file"}
+TX_AUDIO_SAFE_ROOTS = ("/mnt/jffs2/", "/media/", "/tmp/", "/var/run/")
+LOOPBACK_MAX_SECONDS = int(os.environ.get("PLUTO_LOOPBACK_MAX_SECONDS", "10"))
+LOOPBACK_MAX_TX_AMPLITUDE = float(os.environ.get("PLUTO_LOOPBACK_MAX_TX_AMPLITUDE", "0.25"))
+TX_MAX_SECONDS = int(os.environ.get("PLUTO_TX_MAX_SECONDS", "30"))
+TX_MAX_TX_AMPLITUDE = float(os.environ.get("PLUTO_TX_MAX_AMPLITUDE", str(LOOPBACK_MAX_TX_AMPLITUDE)))
+WATCHDOG_WINDOW_SECONDS = 300
+WATCHDOG_MAX_RESTARTS = 3
+CAPTURE_MAX_SECONDS = int(os.environ.get("PLUTO_CAPTURE_MAX_SECONDS", "60"))
+CAPTURE_MAX_BYTES = int(os.environ.get("PLUTO_CAPTURE_MAX_BYTES", str(16 * 1024 * 1024)))
+SPECTRUM_MAX_BINS = int(os.environ.get("PLUTO_SPECTRUM_MAX_BINS", "1024"))
+SPECTRUM_MAX_TOP_N = int(os.environ.get("PLUTO_SPECTRUM_MAX_TOP_N", "20"))
+DOPPLER_MAX_POINTS = int(os.environ.get("PLUTO_DOPPLER_MAX_POINTS", "7200"))
+DOPPLER_MIN_INTERVAL_MS = int(os.environ.get("PLUTO_DOPPLER_MIN_INTERVAL_MS", "250"))
+LOG_FILES = {
+    "messages": Path("/var/log/messages"),
+    "syslog": Path("/var/log/syslog"),
+    "audio": STATE_DIR / "audio-backend.log",
+    "profile_check": STATE_DIR / "profile-check.err",
+}
+DEMOSAFE_FIELDS = {
+    "name",
+    "label",
+    "description",
+    "default_frequency_hz",
+    "sample_rate_hz",
+    "rf_bandwidth_hz",
+    "gain_control_mode",
+    "gain_db",
+    "demod_mode",
+    "audio_rate_hz",
+    "filter_width_hz",
+    "cw_bfo_hz",
+    "squelch_db",
+    "deemphasis",
+    "agc",
+    "output_gain",
+    "noise_gate_db",
+    "dc_block",
+    "stream_format",
+    "tx_allowed",
+    "tx_mode",
+    "tx_duration_limit_seconds",
+    "loopback_duration_limit_seconds",
+    "tx_gain_db",
+    "tx_tone_hz",
+    "tx_amplitude",
+    "tx_audio_source",
+    "tx_audio_path",
+    "tx_audio_rate_hz",
+    "tx_audio_tone_hz",
+    "tx_am_modulation_index",
+    "tx_fm_deviation_hz",
+    "tx_cw_text",
+    "tx_cw_wpm",
+}
+
+
+class ApiError(Exception):
+    def __init__(self, code, message, status=400, details=None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
+        self.details = details or {}
+
+
+def is_cgi():
+    return "REQUEST_METHOD" in os.environ
+
+
+def dry_run():
+    return os.environ.get("PLUTO_RADIO_DRY_RUN") == "1"
+
+
+def profile_dirs():
+    override = os.environ.get("PLUTO_RADIO_PROFILE_DIR")
+    if override:
+        return (Path(override),)
+    return DEFAULT_PROFILE_DIRS
+
+
+def now_utc():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def read_json_file(path, default):
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError as exc:
+        raise ApiError("invalid_state_json", str(exc), status=500)
+
+
+def write_json_file(path, payload):
+    if dry_run():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True)
+        handle.write("\n")
+    os.replace(str(tmp), str(path))
+
+
+def load_state():
+    return read_json_file(STATE_FILE, {})
+
+
+def load_audio_state():
+    return read_json_file(AUDIO_STATE_FILE, {})
+
+
+def load_watchdog_state():
+    return read_json_file(WATCHDOG_STATE_FILE, {})
+
+
+def load_spectrum_state():
+    return read_json_file(SPECTRUM_STATE_FILE, {})
+
+
+def load_doppler_state():
+    return read_json_file(DOPPLER_STATE_FILE, {})
+
+
+def load_loopback_state():
+    return read_json_file(LOOPBACK_STATE_FILE, {})
+
+
+def load_tx_state():
+    return read_json_file(TX_STATE_FILE, {})
+
+
+def load_calibration_state():
+    return read_json_file(CALIBRATION_STATE_FILE, {})
+
+
+def load_self_test_state():
+    return read_json_file(SELF_TEST_STATE_FILE, {})
+
+
+def save_state(**updates):
+    state = load_state()
+    state.update(updates)
+    state["updated_utc"] = now_utc()
+    write_json_file(STATE_FILE, state)
+    return state
+
+
+def save_audio_state(**updates):
+    state = load_audio_state()
+    state.update(updates)
+    state["updated_utc"] = now_utc()
+    write_json_file(AUDIO_STATE_FILE, state)
+    return state
+
+
+def save_watchdog_state(**updates):
+    state = load_watchdog_state()
+    state.update(updates)
+    state["updated_utc"] = now_utc()
+    write_json_file(WATCHDOG_STATE_FILE, state)
+    return state
+
+
+def save_spectrum_state(**updates):
+    state = load_spectrum_state()
+    state.update(updates)
+    state["updated_utc"] = now_utc()
+    write_json_file(SPECTRUM_STATE_FILE, state)
+    return state
+
+
+def save_doppler_state(**updates):
+    state = load_doppler_state()
+    state.update(updates)
+    state["updated_utc"] = now_utc()
+    write_json_file(DOPPLER_STATE_FILE, state)
+    return state
+
+
+def save_loopback_state(**updates):
+    state = load_loopback_state()
+    state.update(updates)
+    state["updated_utc"] = now_utc()
+    write_json_file(LOOPBACK_STATE_FILE, state)
+    return state
+
+
+def save_tx_state(**updates):
+    state = load_tx_state()
+    state.update(updates)
+    state["updated_utc"] = now_utc()
+    write_json_file(TX_STATE_FILE, state)
+    return state
+
+
+def save_calibration_state(**updates):
+    state = load_calibration_state()
+    state.update(updates)
+    state["updated_utc"] = now_utc()
+    write_json_file(CALIBRATION_STATE_FILE, state)
+    return state
+
+
+def save_self_test_state(**updates):
+    state = load_self_test_state()
+    state.update(updates)
+    state["updated_utc"] = now_utc()
+    write_json_file(SELF_TEST_STATE_FILE, state)
+    return state
+
+
+def fail_state(code, message):
+    try:
+        save_state(last_error={"code": code, "message": message, "time_utc": now_utc()})
+    except Exception:
+        pass
+
+
+def fail_audio_state(code, message):
+    try:
+        save_audio_state(
+            state="error",
+            last_error={"code": code, "message": message, "time_utc": now_utc()},
+        )
+    except Exception:
+        pass
+
+
+def json_response(payload, status=200):
+    if is_cgi():
+        if status != 200:
+            print(f"Status: {status}")
+        print("Content-Type: application/json")
+        print("Cache-Control: no-store")
+        print()
+    print(json.dumps(payload, sort_keys=True))
+
+
+def read_request_body():
+    length = int(os.environ.get("CONTENT_LENGTH") or "0")
+    if length <= 0:
+        return {}
+    raw = sys.stdin.read(length)
+    content_type = os.environ.get("CONTENT_TYPE", "")
+    if "application/json" in content_type:
+        try:
+            return json.loads(raw or "{}")
+        except json.JSONDecodeError as exc:
+            raise ApiError("invalid_json", str(exc))
+    parsed = parse_qs(raw, keep_blank_values=True)
+    return {key: values[-1] for key, values in parsed.items()}
+
+
+def query_params():
+    parsed = parse_qs(os.environ.get("QUERY_STRING", ""), keep_blank_values=True)
+    return {key: values[-1] for key, values in parsed.items()}
+
+
+def validate_uint(value, key, min_value, max_value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ApiError("invalid_value", f"{key} must be an integer", details={key: value})
+    if number < min_value or number > max_value:
+        raise ApiError(
+            "out_of_range",
+            f"{key} must be between {min_value} and {max_value}",
+            details={key: number},
+        )
+    return number
+
+
+def validate_decimal(value, key, min_value=-120.0, max_value=120.0):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ApiError("invalid_value", f"{key} must be numeric", details={key: value})
+    if number < min_value or number > max_value:
+        raise ApiError(
+            "out_of_range",
+            f"{key} must be between {min_value} and {max_value}",
+            details={key: number},
+        )
+    return number
+
+
+def validate_bool(value, key):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    raise ApiError("invalid_value", f"{key} must be boolean", details={key: value})
+
+
+def validate_profile_name(name):
+    if not isinstance(name, str) or not PROFILE_RE.match(name):
+        raise ApiError("invalid_profile", "profile name is invalid", details={"profile": name})
+    return name
+
+
+def validate_capture_id(capture_id):
+    if not isinstance(capture_id, str) or not CAPTURE_ID_RE.match(capture_id):
+        raise ApiError("invalid_capture_id", "capture id is invalid", details={"capture_id": capture_id})
+    return capture_id
+
+
+def validate_tx_audio_path(value):
+    if not isinstance(value, str) or not value:
+        raise ApiError("invalid_value", "audio_path is required for file audio source", details={"audio_path": value})
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts or not any(str(path).startswith(root) for root in TX_AUDIO_SAFE_ROOTS):
+        raise ApiError(
+            "invalid_audio_path",
+            "audio_path must be under /mnt/jffs2, /media, /tmp, or /var/run",
+            details={"audio_path": value},
+        )
+    return str(path)
+
+
+def validate_cw_text(value):
+    if value is None or value == "":
+        return "CQ PLUTO"
+    if not isinstance(value, str):
+        raise ApiError("invalid_value", "cw_text must be text", details={"cw_text": value})
+    text = value[:80]
+    if not re.match(r"^[A-Za-z0-9 .,?/+-]+$", text):
+        raise ApiError("invalid_value", "cw_text contains unsupported characters", details={"cw_text": value})
+    return text
+
+
+def validate_optional_decimal(payload, key, default, min_value, max_value):
+    if key not in payload:
+        return default
+    return validate_decimal(payload.get(key), key, min_value, max_value)
+
+
+def validate_notes(value):
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ApiError("invalid_value", "notes must be text", details={"notes": value})
+    return value[:200]
+
+
+def clean_profile(profile, source):
+    name = validate_profile_name(profile.get("name", ""))
+    cleaned = {key: profile[key] for key in profile if key in DEMOSAFE_FIELDS}
+    cleaned["name"] = name
+    cleaned["default_frequency_hz"] = validate_uint(
+        cleaned.get("default_frequency_hz"), "default_frequency_hz", 70_000_000, 6_000_000_000
+    )
+    cleaned["sample_rate_hz"] = validate_uint(
+        cleaned.get("sample_rate_hz"), "sample_rate_hz", 520_000, 61_440_000
+    )
+    cleaned["rf_bandwidth_hz"] = validate_uint(
+        cleaned.get("rf_bandwidth_hz"), "rf_bandwidth_hz", 200_000, 56_000_000
+    )
+    mode = cleaned.get("gain_control_mode", "manual")
+    if mode not in GAIN_MODES:
+        raise ApiError("invalid_profile", "profile gain_control_mode is invalid", details={"profile": name})
+    cleaned["gain_control_mode"] = mode
+    cleaned["gain_db"] = validate_decimal(cleaned.get("gain_db", 40), "gain_db")
+    demod = cleaned.get("demod_mode")
+    if demod and demod not in AUDIO_DEMODES and demod != "iq":
+        raise ApiError("invalid_profile", "profile demod_mode is invalid", details={"profile": name, "demod_mode": demod})
+    cleaned["audio_rate_hz"] = validate_uint(cleaned.get("audio_rate_hz", 0), "audio_rate_hz", 0, 48000)
+    cleaned["filter_width_hz"] = validate_uint(
+        cleaned.get("filter_width_hz", 0), "filter_width_hz", 0, cleaned["sample_rate_hz"]
+    )
+    if "cw_bfo_hz" in cleaned:
+        cleaned["cw_bfo_hz"] = validate_uint(cleaned.get("cw_bfo_hz"), "cw_bfo_hz", 100, 3000)
+    cleaned["squelch_db"] = validate_decimal(cleaned.get("squelch_db", -120), "squelch_db", -120.0, 0.0)
+    deemphasis = cleaned.get("deemphasis", "none")
+    if deemphasis not in DEEMPHASIS_MODES:
+        raise ApiError("invalid_profile", "profile deemphasis is invalid", details={"profile": name, "deemphasis": deemphasis})
+    cleaned["deemphasis"] = deemphasis
+    agc = cleaned.get("agc", "manual")
+    if agc not in AUDIO_AGC_MODES:
+        raise ApiError("invalid_profile", "profile agc is invalid", details={"profile": name, "agc": agc})
+    cleaned["agc"] = agc
+    cleaned["output_gain"] = validate_decimal(cleaned.get("output_gain", 1.0), "output_gain", 0.0, 16.0)
+    cleaned["noise_gate_db"] = validate_decimal(cleaned.get("noise_gate_db", -120), "noise_gate_db", -120.0, 0.0)
+    cleaned["dc_block"] = validate_bool(cleaned.get("dc_block", True), "dc_block")
+    cleaned["tx_allowed"] = bool(cleaned.get("tx_allowed", False))
+    tx_mode = cleaned.get("tx_mode", "tone")
+    if tx_mode not in TX_MODES:
+        raise ApiError("invalid_profile", "profile tx_mode is invalid", details={"profile": name, "tx_mode": tx_mode})
+    cleaned["tx_mode"] = tx_mode
+    audio_source = cleaned.get("tx_audio_source", "tone")
+    if audio_source not in TX_AUDIO_SOURCES:
+        raise ApiError("invalid_profile", "profile audio_source is invalid", details={"profile": name})
+    cleaned["tx_audio_source"] = audio_source
+    if "tx_audio_path" in cleaned and cleaned["tx_audio_path"]:
+        cleaned["tx_audio_path"] = validate_tx_audio_path(cleaned["tx_audio_path"])
+    cleaned["tx_audio_rate_hz"] = validate_uint(cleaned.get("tx_audio_rate_hz", 8000), "tx_audio_rate_hz", 8000, 48000)
+    cleaned["tx_audio_tone_hz"] = validate_uint(cleaned.get("tx_audio_tone_hz", 1000), "tx_audio_tone_hz", 20, 3000)
+    cleaned["tx_am_modulation_index"] = validate_decimal(
+        cleaned.get("tx_am_modulation_index", 0.8), "tx_am_modulation_index", 0.0, 1.0
+    )
+    cleaned["tx_fm_deviation_hz"] = validate_uint(
+        cleaned.get("tx_fm_deviation_hz", 5000), "tx_fm_deviation_hz", 100, 25000
+    )
+    cleaned["tx_cw_text"] = validate_cw_text(cleaned.get("tx_cw_text", "CQ PLUTO"))
+    cleaned["tx_cw_wpm"] = validate_uint(cleaned.get("tx_cw_wpm", 12), "tx_cw_wpm", 5, 40)
+    cleaned["tx_duration_limit_seconds"] = validate_uint(
+        cleaned.get("tx_duration_limit_seconds", 0),
+        "tx_duration_limit_seconds",
+        0,
+        TX_MAX_SECONDS,
+    )
+    cleaned["loopback_duration_limit_seconds"] = validate_uint(
+        cleaned.get("loopback_duration_limit_seconds", 0),
+        "loopback_duration_limit_seconds",
+        0,
+        LOOPBACK_MAX_SECONDS,
+    )
+    cleaned["tx_gain_db"] = validate_decimal(cleaned.get("tx_gain_db", -30.0), "tx_gain_db", -89.75, 0.0)
+    cleaned["tx_tone_hz"] = validate_uint(cleaned.get("tx_tone_hz", 10000), "tx_tone_hz", 0, 200000)
+    if cleaned["tx_mode"] == "tone" and cleaned["tx_tone_hz"] < 100:
+        raise ApiError("invalid_profile", "tone TX profiles require tx_tone_hz >= 100", details={"profile": name})
+    if cleaned["tx_mode"] in {"am", "fm"} and cleaned["tx_audio_source"] == "file" and not cleaned.get("tx_audio_path"):
+        raise ApiError("invalid_profile", "file audio profiles require audio_path", details={"profile": name})
+    cleaned["tx_amplitude"] = validate_decimal(
+        cleaned.get("tx_amplitude", 0.05), "tx_amplitude", 0.0, TX_MAX_TX_AMPLITUDE
+    )
+    cleaned["source"] = str(source)
+    return cleaned
+
+
+def load_profiles():
+    profiles = {}
+    for directory in reversed(profile_dirs()):
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.json")):
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    profile = clean_profile(json.load(handle), path)
+            except json.JSONDecodeError as exc:
+                raise ApiError("invalid_profile_json", f"{path}: {exc}", status=500)
+            if path.stem != profile["name"]:
+                raise ApiError(
+                    "invalid_profile",
+                    "profile filename must match profile name",
+                    status=500,
+                    details={"file": str(path), "name": profile["name"]},
+                )
+            profiles[profile["name"]] = profile
+    return profiles
+
+
+def get_profile(name):
+    name = validate_profile_name(name)
+    profiles = load_profiles()
+    if name not in profiles:
+        raise ApiError("unknown_profile", "profile does not exist", details={"profile": name}, status=404)
+    return profiles[name]
+
+
+def active_profile_from_state():
+    state = load_state()
+    name = state.get("active_profile")
+    if not name:
+        raise ApiError("no_active_profile", "apply a radio profile before starting audio", status=409)
+    return get_profile(name)
+
+
+def find_iio_device(name=RADIO_NAME):
+    root = Path("/sys/bus/iio/devices")
+    if not root.is_dir():
+        return None
+    for candidate in root.glob("iio:device*"):
+        name_file = candidate / "name"
+        try:
+            if name_file.read_text(encoding="utf-8").strip() == name:
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def read_attr(device, attr):
+    if not device:
+        return None
+    path = device / attr
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def write_attr(device, attr, value, required=False):
+    if dry_run():
+        return {"attr": attr, "value": str(value), "status": "dry_run"}
+    if not device:
+        raise ApiError("radio_not_found", f"{RADIO_NAME} was not found", status=503)
+    path = device / attr
+    if not path.exists():
+        if required:
+            raise ApiError("missing_radio_attr", f"missing required radio attribute {attr}", status=503)
+        return {"attr": attr, "value": str(value), "status": "missing"}
+    try:
+        path.write_text(str(value), encoding="utf-8")
+    except OSError as exc:
+        raise ApiError("radio_write_failed", f"failed writing {attr}: {exc}", status=503)
+    return {"attr": attr, "value": str(value), "status": "ok"}
+
+
+def current_radio_attrs():
+    device = find_iio_device()
+    attrs = {
+        "phy_path": str(device) if device else "",
+        "radio_present": bool(device),
+        "rx_lo_hz": read_attr(device, "out_altvoltage0_RX_LO_frequency"),
+        "tx_lo_hz": read_attr(device, "out_altvoltage1_TX_LO_frequency"),
+        "rx_sample_rate_hz": read_attr(device, "in_voltage_sampling_frequency"),
+        "rx_rf_bandwidth_hz": read_attr(device, "in_voltage_rf_bandwidth"),
+        "rx_gain_control_mode_ch0": read_attr(device, "in_voltage0_gain_control_mode"),
+        "rx_gain_control_mode_ch1": read_attr(device, "in_voltage1_gain_control_mode"),
+        "rx_hardwaregain_db_ch0": read_attr(device, "in_voltage0_hardwaregain"),
+        "rx_hardwaregain_db_ch1": read_attr(device, "in_voltage1_hardwaregain"),
+        "ensm_mode": read_attr(device, "ensm_mode"),
+        "temperature_raw": read_attr(device, "temp0_input"),
+    }
+    return attrs
+
+
+def apply_profile(payload):
+    profile = get_profile(payload.get("profile", ""))
+    frequency = validate_uint(
+        payload.get("frequency_hz", profile["default_frequency_hz"]),
+        "frequency_hz",
+        70_000_000,
+        6_000_000_000,
+    )
+    gain_db = validate_decimal(payload.get("gain_db", profile["gain_db"]), "gain_db")
+    gain_mode = payload.get("gain_control_mode", profile["gain_control_mode"])
+    if gain_mode not in GAIN_MODES:
+        raise ApiError("invalid_value", "gain_control_mode is invalid", details={"gain_control_mode": gain_mode})
+
+    device = find_iio_device()
+    writes = [
+        write_attr(device, "out_altvoltage0_RX_LO_frequency", frequency, required=True),
+        write_attr(device, "in_voltage_rf_bandwidth", profile["rf_bandwidth_hz"], required=True),
+        write_attr(device, "in_voltage_sampling_frequency", profile["sample_rate_hz"], required=True),
+        write_attr(device, "in_voltage0_gain_control_mode", gain_mode, required=True),
+        write_attr(device, "in_voltage1_gain_control_mode", gain_mode),
+    ]
+    if gain_mode == "manual":
+        writes.extend(
+            [
+                write_attr(device, "in_voltage0_hardwaregain", gain_db, required=True),
+                write_attr(device, "in_voltage1_hardwaregain", gain_db),
+            ]
+        )
+
+    state = save_state(
+        active_profile=profile["name"],
+        requested_frequency_hz=frequency,
+        actual_frequency_hz=read_attr(device, "out_altvoltage0_RX_LO_frequency") or frequency,
+        gain_control_mode=gain_mode,
+        gain_db=gain_db,
+        stream_state="idle",
+        radio_state="tuned",
+        profile_settings={
+            "sample_rate_hz": profile["sample_rate_hz"],
+            "rf_bandwidth_hz": profile["rf_bandwidth_hz"],
+            "demod_mode": profile.get("demod_mode"),
+            "audio_rate_hz": profile.get("audio_rate_hz"),
+            "filter_width_hz": profile.get("filter_width_hz"),
+            "squelch_db": profile.get("squelch_db"),
+            "deemphasis": profile.get("deemphasis"),
+            "agc": profile.get("agc"),
+            "output_gain": profile.get("output_gain"),
+            "noise_gate_db": profile.get("noise_gate_db"),
+            "dc_block": profile.get("dc_block"),
+            "stream_format": profile.get("stream_format"),
+        },
+        last_error=None,
+    )
+    return {"ok": True, "profile": profile["name"], "state": state, "writes": writes}
+
+
+def tune(payload):
+    frequency = validate_uint(payload.get("frequency_hz"), "frequency_hz", 70_000_000, 6_000_000_000)
+    device = find_iio_device()
+    writes = [write_attr(device, "out_altvoltage0_RX_LO_frequency", frequency, required=True)]
+    state = save_state(
+        requested_frequency_hz=frequency,
+        actual_frequency_hz=read_attr(device, "out_altvoltage0_RX_LO_frequency") or frequency,
+        radio_state="tuned",
+        last_error=None,
+    )
+    return {"ok": True, "state": state, "writes": writes}
+
+
+def stop_radio():
+    stop_audio()
+    try:
+        stop_tx()
+    except ApiError:
+        if not dry_run():
+            raise
+    state = save_state(stream_state="idle", radio_state="idle", last_error=None)
+    return {"ok": True, "state": state}
+
+
+def list_profiles():
+    return {"ok": True, "profiles": list(load_profiles().values())}
+
+
+def radio_status():
+    state = load_state()
+    attrs = current_radio_attrs()
+    return {
+        "ok": True,
+        "radio": {
+            "active_profile": state.get("active_profile"),
+            "requested_frequency_hz": state.get("requested_frequency_hz"),
+            "actual_frequency_hz": attrs.get("rx_lo_hz") or state.get("actual_frequency_hz"),
+            "gain_control_mode": attrs.get("rx_gain_control_mode_ch0") or state.get("gain_control_mode"),
+            "gain_db": attrs.get("rx_hardwaregain_db_ch0") or state.get("gain_db"),
+            "stream_state": state.get("stream_state", "idle"),
+            "audio": audio_status()["audio"],
+            "radio_state": state.get("radio_state", "idle"),
+            "last_error": state.get("last_error"),
+            "tx_policy": "disabled_by_default_no_enable_api",
+            "tx_allowed": False,
+        },
+        "iio": attrs,
+    }
+
+
+def process_alive(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return dry_run()
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def selected_audio_profile(payload):
+    profile_name = payload.get("profile")
+    if profile_name:
+        profile = get_profile(profile_name)
+        if "frequency_hz" in payload or "gain_db" in payload:
+            apply_profile(payload)
+        return profile
+    return active_profile_from_state()
+
+
+def audio_capable_profile(profile):
+    demod = profile.get("demod_mode")
+    audio_rate = int(profile.get("audio_rate_hz") or 0)
+    if demod not in AUDIO_DEMODES or audio_rate <= 0:
+        raise ApiError(
+            "audio_not_supported",
+            "profile does not define a firmware audio mode",
+            status=409,
+            details={"profile": profile.get("name"), "demod_mode": demod, "audio_rate_hz": audio_rate},
+        )
+    return demod, audio_rate
+
+
+def audio_controls(profile, payload):
+    controls = {
+        "filter_width_hz": validate_uint(
+            payload.get("filter_width_hz", profile.get("filter_width_hz", 0)),
+            "filter_width_hz",
+            0,
+            profile["sample_rate_hz"],
+        ),
+        "cw_bfo_hz": validate_uint(
+            payload.get("cw_bfo_hz", profile.get("cw_bfo_hz", 700)),
+            "cw_bfo_hz",
+            100,
+            3000,
+        ),
+        "squelch_db": validate_decimal(
+            payload.get("squelch_db", profile.get("squelch_db", -120)),
+            "squelch_db",
+            -120.0,
+            0.0,
+        ),
+        "output_gain": validate_decimal(
+            payload.get("output_gain", profile.get("output_gain", 1.0)),
+            "output_gain",
+            0.0,
+            16.0,
+        ),
+        "noise_gate_db": validate_decimal(
+            payload.get("noise_gate_db", profile.get("noise_gate_db", -120)),
+            "noise_gate_db",
+            -120.0,
+            0.0,
+        ),
+        "dc_block": validate_bool(payload.get("dc_block", profile.get("dc_block", True)), "dc_block"),
+    }
+    deemphasis = payload.get("deemphasis", profile.get("deemphasis", "none"))
+    if deemphasis not in DEEMPHASIS_MODES:
+        raise ApiError("invalid_value", "deemphasis is invalid", details={"deemphasis": deemphasis})
+    controls["deemphasis"] = deemphasis
+    agc = payload.get("agc", profile.get("agc", "manual"))
+    if agc not in AUDIO_AGC_MODES:
+        raise ApiError("invalid_value", "agc is invalid", details={"agc": agc})
+    controls["agc"] = agc
+    return controls
+
+
+def audio_backend_path(payload):
+    if str(payload.get("simulate", "")).lower() in {"1", "true", "yes"}:
+        return SIM_AUDIO_BACKEND, "simulated_pcm"
+    override = os.environ.get("PLUTO_AUDIO_BACKEND")
+    if override:
+        return Path(override), "external"
+    return DEFAULT_AUDIO_BACKEND, "external"
+
+
+def audio_status():
+    state = load_audio_state()
+    status = state.get("state", "stopped")
+    pid = state.get("pid")
+    if status == "running" and not process_alive(pid):
+        status = "error"
+        state["state"] = status
+        state["last_error"] = {
+            "code": "audio_process_exited",
+            "message": "audio backend process is no longer running",
+            "time_utc": now_utc(),
+        }
+        if not dry_run():
+            save_audio_state(**state)
+            save_state(stream_state="error")
+    return {
+        "ok": True,
+        "audio": {
+            "state": status,
+            "profile": state.get("profile"),
+            "demod_mode": state.get("demod_mode"),
+            "audio_rate_hz": state.get("audio_rate_hz"),
+            "stream_format": state.get("stream_format", "pcm_s16le"),
+            "fifo_path": state.get("fifo_path", str(AUDIO_FIFO)),
+            "pid": pid,
+            "backend": state.get("backend"),
+            "restart_count": state.get("restart_count", 0),
+            "rms_level": state.get("rms_level"),
+            "squelch_state": state.get("squelch_state", "unknown"),
+            "controls": state.get("controls", {}),
+            "started_utc": state.get("started_utc"),
+            "stopped_utc": state.get("stopped_utc"),
+            "last_error": state.get("last_error"),
+        },
+    }
+
+
+def start_audio(payload):
+    existing = audio_status()["audio"]
+    if existing["state"] == "running":
+        return {"ok": True, "audio": existing}
+
+    profile = selected_audio_profile(payload)
+    demod, audio_rate = audio_capable_profile(profile)
+    controls = audio_controls(profile, payload)
+    backend, backend_kind = audio_backend_path(payload)
+    if dry_run():
+        state = {
+            "state": "running",
+            "profile": profile["name"],
+            "demod_mode": demod,
+            "audio_rate_hz": audio_rate,
+            "stream_format": profile.get("stream_format", "pcm_s16le"),
+            "fifo_path": str(AUDIO_FIFO),
+            "pid": 0,
+            "backend": "dry_run",
+            "rms_level": None,
+            "squelch_state": "unknown",
+            "controls": controls,
+            "started_utc": now_utc(),
+            "stopped_utc": None,
+            "last_error": None,
+        }
+        return {"ok": True, "audio": state}
+
+    if not backend.is_file() or not os.access(str(backend), os.X_OK):
+        message = f"audio backend is not installed: {backend}"
+        fail_audio_state("audio_backend_missing", message)
+        save_state(stream_state="error")
+        raise ApiError("audio_backend_missing", message, status=503, details={"backend": str(backend)})
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if AUDIO_FIFO.exists() and not AUDIO_FIFO.is_fifo():
+        AUDIO_FIFO.unlink()
+    if not AUDIO_FIFO.exists():
+        os.mkfifo(str(AUDIO_FIFO), 0o600)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PLUTO_AUDIO_FIFO": str(AUDIO_FIFO),
+            "PLUTO_AUDIO_PROFILE": profile["name"],
+            "PLUTO_AUDIO_DEMOD": demod,
+            "PLUTO_AUDIO_RATE_HZ": str(audio_rate),
+            "PLUTO_DSP_INPUT_RATE_HZ": str(profile.get("sample_rate_hz", "")),
+            "PLUTO_AUDIO_FILTER_WIDTH_HZ": str(controls["filter_width_hz"]),
+            "PLUTO_AUDIO_CW_BFO_HZ": str(controls["cw_bfo_hz"]),
+            "PLUTO_AUDIO_SQUELCH_DB": str(controls["squelch_db"]),
+            "PLUTO_AUDIO_DEEMPHASIS": controls["deemphasis"],
+            "PLUTO_AUDIO_AGC": controls["agc"],
+            "PLUTO_AUDIO_OUTPUT_GAIN": str(controls["output_gain"]),
+            "PLUTO_AUDIO_NOISE_GATE_DB": str(controls["noise_gate_db"]),
+            "PLUTO_AUDIO_DC_BLOCK": "1" if controls["dc_block"] else "0",
+        }
+    )
+    log_path = STATE_DIR / "audio-backend.log"
+    log = log_path.open("ab")
+    proc = subprocess.Popen([str(backend)], stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env)
+    state = save_audio_state(
+        state="running",
+        profile=profile["name"],
+        demod_mode=demod,
+        audio_rate_hz=audio_rate,
+        stream_format=profile.get("stream_format", "pcm_s16le"),
+        fifo_path=str(AUDIO_FIFO),
+        pid=proc.pid,
+        backend=backend_kind,
+        backend_path=str(backend),
+        rms_level=None,
+        squelch_state="unknown",
+        controls=controls,
+        restart_count=load_audio_state().get("restart_count", 0),
+        started_utc=now_utc(),
+        stopped_utc=None,
+        last_error=None,
+    )
+    save_state(stream_state="audio")
+    return {"ok": True, "audio": state}
+
+
+def stop_audio():
+    state = load_audio_state()
+    pid = state.get("pid")
+    if process_alive(pid) and os.name != "nt":
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except OSError:
+            pass
+        deadline = time.time() + 2
+        while time.time() < deadline and process_alive(pid):
+            time.sleep(0.1)
+        if process_alive(pid):
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except OSError:
+                pass
+    stopped = save_audio_state(
+        state="stopped",
+        stopped_utc=now_utc(),
+        pid=None,
+        last_error=None,
+    )
+    save_state(stream_state="idle")
+    return {"ok": True, "audio": audio_status()["audio"], "state": stopped}
+
+
+def restart_timestamps(state):
+    raw = state.get("audio_restart_utc", [])
+    cutoff = time.time() - WATCHDOG_WINDOW_SECONDS
+    fresh = []
+    for item in raw:
+        try:
+            parsed = time.mktime(time.strptime(item, "%Y-%m-%dT%H:%M:%SZ"))
+        except (TypeError, ValueError):
+            continue
+        if parsed >= cutoff:
+            fresh.append(item)
+    return fresh
+
+
+def watchdog_status():
+    audio = audio_status()["audio"]
+    state = load_watchdog_state()
+    return {
+        "ok": True,
+        "watchdog": {
+            "audio_state": audio["state"],
+            "audio_pid": audio["pid"],
+            "audio_process_alive": process_alive(audio["pid"]),
+            "audio_restart_count": load_audio_state().get("restart_count", 0),
+            "restart_window_seconds": WATCHDOG_WINDOW_SECONDS,
+            "max_restarts_per_window": WATCHDOG_MAX_RESTARTS,
+            "degraded": audio["state"] == "degraded",
+            "last_action": state.get("last_action"),
+            "last_reason": state.get("last_reason"),
+            "last_check_utc": state.get("last_check_utc"),
+        },
+    }
+
+
+def watchdog_check(payload=None):
+    payload = payload or {}
+    audio_state = load_audio_state()
+    status = audio_status()["audio"]
+    action = "none"
+    reason = "audio_state_" + status["state"]
+
+    if status["state"] == "error" and audio_state.get("profile"):
+        wstate = load_watchdog_state()
+        fresh = restart_timestamps(wstate)
+        if len(fresh) >= WATCHDOG_MAX_RESTARTS:
+            save_audio_state(state="degraded")
+            save_state(stream_state="degraded")
+            action = "degraded"
+            reason = "audio_restart_limit_reached"
+        else:
+            restart_payload = {"profile": audio_state["profile"]}
+            restart_payload.update(audio_state.get("controls") or {})
+            if audio_state.get("backend") == "simulated_pcm":
+                restart_payload["simulate"] = "true"
+            restarted = start_audio(restart_payload)
+            fresh.append(now_utc())
+            save_audio_state(restart_count=int(audio_state.get("restart_count") or 0) + 1)
+            action = "restarted"
+            reason = "audio_process_exited"
+            status = restarted["audio"]
+        save_watchdog_state(
+            audio_restart_utc=fresh,
+            last_action=action,
+            last_reason=reason,
+            last_check_utc=now_utc(),
+        )
+    else:
+        save_watchdog_state(last_action=action, last_reason=reason, last_check_utc=now_utc())
+
+    result = watchdog_status()
+    result["watchdog"]["action"] = action
+    result["watchdog"]["reason"] = reason
+    return result
+
+
+def stream_audio(format_name, params):
+    status = audio_status()["audio"]
+    if status["state"] != "running":
+        raise ApiError("audio_not_running", "audio stream is not running", status=409)
+    if dry_run():
+        raise ApiError("audio_stream_unavailable", "audio streaming is unavailable in dry-run mode", status=503)
+    rate = int(status.get("audio_rate_hz") or 48000)
+    seconds = validate_uint(params.get("seconds", 2), "seconds", 1, 10)
+    bytes_remaining = rate * 2 * seconds
+    if is_cgi():
+        print("Content-Type: audio/L16" if format_name == "pcm" else "Content-Type: audio/wav")
+        print("Cache-Control: no-store")
+        print()
+    if format_name == "wav":
+        sys.stdout.buffer.write(wav_header(bytes_remaining, rate))
+    fd = os.open(str(AUDIO_FIFO), os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        deadline = time.time() + seconds
+        while bytes_remaining > 0 and time.time() < deadline:
+            try:
+                chunk = os.read(fd, min(4096, bytes_remaining))
+            except BlockingIOError:
+                time.sleep(0.02)
+                continue
+            if not chunk:
+                time.sleep(0.02)
+                continue
+            sys.stdout.buffer.write(chunk)
+            bytes_remaining -= len(chunk)
+    finally:
+        os.close(fd)
+
+
+def capture_base_dir(payload=None):
+    payload = payload or {}
+    requested = payload.get("directory") or os.environ.get("PLUTO_CAPTURE_DIR")
+    base = Path(requested) if requested else DEFAULT_CAPTURE_DIR
+    if dry_run():
+        return base
+    allowed = [Path("/mnt/jffs2"), Path("/media")]
+    try:
+        resolved = base.resolve()
+    except OSError:
+        resolved = base
+    if not any(str(resolved).startswith(str(root)) for root in allowed):
+        raise ApiError("invalid_capture_dir", "capture directory must be under /mnt/jffs2 or /media", details={"directory": str(base)})
+    return base
+
+
+def capture_paths(capture_id, payload=None):
+    capture_id = validate_capture_id(capture_id)
+    base = capture_base_dir(payload)
+    return base / f"{capture_id}.bin", base / f"{capture_id}.json"
+
+
+def capture_id_for(profile_name, capture_type):
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    return f"{stamp}-{profile_name.lower()}-{capture_type.lower()}"
+
+
+def capture_metadata_from_file(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def capture_list(params=None):
+    base = capture_base_dir(params)
+    captures = []
+    if base.is_dir():
+        for meta_path in sorted(base.glob("*.json")):
+            meta = capture_metadata_from_file(meta_path)
+            if not meta:
+                continue
+            data_path = base / f"{meta.get('capture_id', meta_path.stem)}.bin"
+            meta["size_bytes"] = data_path.stat().st_size if data_path.is_file() else 0
+            captures.append(meta)
+    return {"ok": True, "capture_dir": str(base), "captures": captures}
+
+
+def capture_metadata(params):
+    capture_id = validate_capture_id(params.get("capture_id", ""))
+    _data_path, meta_path = capture_paths(capture_id, params)
+    meta = capture_metadata_from_file(meta_path)
+    if not meta:
+        raise ApiError("capture_not_found", "capture metadata was not found", status=404, details={"capture_id": capture_id})
+    return {"ok": True, "capture": meta}
+
+
+def start_capture(payload):
+    profile = selected_audio_profile(payload) if payload.get("profile") else active_profile_from_state()
+    capture_type = payload.get("type", "iq")
+    if capture_type not in {"iq", "audio"}:
+        raise ApiError("invalid_capture_type", "capture type must be iq or audio", details={"type": capture_type})
+    duration = validate_uint(payload.get("duration_seconds", 10), "duration_seconds", 1, CAPTURE_MAX_SECONDS)
+    max_bytes = validate_uint(payload.get("max_bytes", CAPTURE_MAX_BYTES), "max_bytes", 1, CAPTURE_MAX_BYTES)
+    capture_id = validate_capture_id(payload.get("capture_id") or capture_id_for(profile["name"], capture_type))
+    data_path, meta_path = capture_paths(capture_id, payload)
+
+    metadata = {
+        "capture_id": capture_id,
+        "type": capture_type,
+        "profile": profile["name"],
+        "frequency_hz": load_state().get("requested_frequency_hz") or profile.get("default_frequency_hz"),
+        "sample_rate_hz": profile.get("sample_rate_hz"),
+        "rf_bandwidth_hz": profile.get("rf_bandwidth_hz"),
+        "gain_db": load_state().get("gain_db") or profile.get("gain_db"),
+        "duration_seconds": duration,
+        "max_bytes": max_bytes,
+        "created_utc": now_utc(),
+        "data_path": str(data_path),
+        "metadata_path": str(meta_path),
+        "backend": "simulated" if str(payload.get("simulate", "")).lower() in {"1", "true", "yes"} else "external",
+        "state": "complete",
+    }
+
+    if dry_run():
+        return {"ok": True, "capture": metadata}
+
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    simulate = str(payload.get("simulate", "")).lower() in {"1", "true", "yes"}
+    if simulate:
+        sample_size = min(max_bytes, 4096)
+        with data_path.open("wb") as handle:
+            handle.write(bytes((idx % 256 for idx in range(sample_size))))
+        metadata["size_bytes"] = sample_size
+    else:
+        if not CAPTURE_BACKEND.is_file() or not os.access(str(CAPTURE_BACKEND), os.X_OK):
+            raise ApiError("capture_backend_missing", f"capture backend is not installed: {CAPTURE_BACKEND}", status=503)
+        env = os.environ.copy()
+        env.update(
+            {
+                "PLUTO_CAPTURE_PATH": str(data_path),
+                "PLUTO_CAPTURE_TYPE": capture_type,
+                "PLUTO_CAPTURE_PROFILE": profile["name"],
+                "PLUTO_CAPTURE_DURATION_SECONDS": str(duration),
+                "PLUTO_CAPTURE_MAX_BYTES": str(max_bytes),
+            }
+        )
+        proc = subprocess.run([str(CAPTURE_BACKEND)], check=False, env=env, timeout=duration + 5)
+        if proc.returncode != 0:
+            raise ApiError("capture_failed", "capture backend failed", status=503, details={"returncode": proc.returncode})
+        metadata["size_bytes"] = data_path.stat().st_size if data_path.is_file() else 0
+
+    meta_path.write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
+    return {"ok": True, "capture": metadata}
+
+
+def delete_capture(payload):
+    capture_id = validate_capture_id(payload.get("capture_id", ""))
+    data_path, meta_path = capture_paths(capture_id, payload)
+    removed = []
+    for path in (data_path, meta_path):
+        try:
+            path.unlink()
+            removed.append(str(path))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise ApiError("capture_delete_failed", str(exc), status=500)
+    return {"ok": True, "capture_id": capture_id, "removed": removed}
+
+
+def download_capture(params):
+    capture_id = validate_capture_id(params.get("capture_id", ""))
+    data_path, _meta_path = capture_paths(capture_id, params)
+    if not data_path.is_file():
+        raise ApiError("capture_not_found", "capture data was not found", status=404, details={"capture_id": capture_id})
+    if is_cgi():
+        print("Content-Type: application/octet-stream")
+        print("Cache-Control: no-store")
+        print(f"Content-Disposition: attachment; filename=\"{capture_id}.bin\"")
+        print()
+    with data_path.open("rb") as handle:
+        shutil.copyfileobj(handle, sys.stdout.buffer)
+
+
+def spectrum_profile(payload):
+    if payload.get("profile"):
+        profile = get_profile(payload["profile"])
+        if "frequency_hz" in payload or "gain_db" in payload:
+            apply_profile(payload)
+        return profile
+    return active_profile_from_state()
+
+
+def simulated_spectrum(center_hz, span_hz, bins, top_n):
+    start_hz = center_hz - span_hz // 2
+    step_hz = span_hz / max(1, bins - 1)
+    carriers = (
+        (center_hz - span_hz * 0.18, -49.0),
+        (center_hz + span_hz * 0.07, -42.0),
+        (center_hz + span_hz * 0.31, -56.0),
+    )
+    points = []
+    for idx in range(bins):
+        freq = int(start_hz + idx * step_hz)
+        baseline = -92.0 + ((idx * 17) % 11) * 0.45
+        power = baseline
+        for carrier_freq, carrier_power in carriers:
+            distance_bins = abs(freq - carrier_freq) / max(1.0, step_hz)
+            if distance_bins < 3:
+                power = max(power, carrier_power - distance_bins * 5.5)
+        points.append({"frequency_hz": freq, "power_dbfs": round(power, 2)})
+    noise_floor = round(sum(point["power_dbfs"] for point in points) / len(points), 2)
+    peaks = sorted(points, key=lambda point: point["power_dbfs"], reverse=True)[:top_n]
+    for peak in peaks:
+        peak["snr_db"] = round(peak["power_dbfs"] - noise_floor, 2)
+    return points, peaks, noise_floor
+
+
+def spectrum_status():
+    state = load_spectrum_state()
+    return {
+        "ok": True,
+        "spectrum": {
+            "state": state.get("state", "idle"),
+            "last_profile": state.get("profile"),
+            "last_center_frequency_hz": state.get("center_frequency_hz"),
+            "last_span_hz": state.get("span_hz"),
+            "last_bins": state.get("bins"),
+            "last_backend": state.get("backend"),
+            "last_snapshot_utc": state.get("last_snapshot_utc"),
+            "last_error": state.get("last_error"),
+            "max_bins": SPECTRUM_MAX_BINS,
+            "max_top_n": SPECTRUM_MAX_TOP_N,
+        },
+    }
+
+
+def spectrum_snapshot(payload):
+    profile = spectrum_profile(payload)
+    current_state = load_state()
+    center_hz = validate_uint(
+        payload.get("center_frequency_hz") or payload.get("frequency_hz") or current_state.get("requested_frequency_hz") or profile["default_frequency_hz"],
+        "center_frequency_hz",
+        70_000_000,
+        6_000_000_000,
+    )
+    span_hz = validate_uint(payload.get("span_hz", profile.get("rf_bandwidth_hz", 200_000)), "span_hz", 1_000, 56_000_000)
+    bins = validate_uint(payload.get("bins", 256), "bins", 16, SPECTRUM_MAX_BINS)
+    top_n = validate_uint(payload.get("top_n", 5), "top_n", 1, SPECTRUM_MAX_TOP_N)
+    simulate = dry_run() or str(payload.get("simulate", "")).lower() in {"1", "true", "yes"}
+
+    if simulate:
+        points, peaks, noise_floor = simulated_spectrum(center_hz, span_hz, bins, top_n)
+        backend = "simulated"
+    else:
+        if not SPECTRUM_BACKEND.is_file() or not os.access(str(SPECTRUM_BACKEND), os.X_OK):
+            message = f"spectrum backend is not installed: {SPECTRUM_BACKEND}"
+            save_spectrum_state(
+                state="error",
+                last_error={"code": "spectrum_backend_missing", "message": message, "time_utc": now_utc()},
+            )
+            raise ApiError("spectrum_backend_missing", message, status=503)
+        env = os.environ.copy()
+        env.update(
+            {
+                "PLUTO_SPECTRUM_CENTER_HZ": str(center_hz),
+                "PLUTO_SPECTRUM_SPAN_HZ": str(span_hz),
+                "PLUTO_SPECTRUM_BINS": str(bins),
+                "PLUTO_SPECTRUM_TOP_N": str(top_n),
+                "PLUTO_SPECTRUM_PROFILE": profile["name"],
+            }
+        )
+        proc = subprocess.run([str(SPECTRUM_BACKEND)], check=False, capture_output=True, text=True, env=env, timeout=10)
+        if proc.returncode != 0:
+            raise ApiError("spectrum_failed", "spectrum backend failed", status=503, details={"returncode": proc.returncode})
+        try:
+            backend_payload = json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            raise ApiError("spectrum_backend_json", str(exc), status=503)
+        points = backend_payload.get("points", [])
+        peaks = backend_payload.get("peaks", [])
+        noise_floor = backend_payload.get("noise_floor_dbfs")
+        backend = "external"
+
+    save_spectrum_state(
+        state="idle",
+        profile=profile["name"],
+        center_frequency_hz=center_hz,
+        span_hz=span_hz,
+        bins=bins,
+        backend=backend,
+        last_snapshot_utc=now_utc(),
+        last_error=None,
+    )
+    return {
+        "ok": True,
+        "spectrum": {
+            "profile": profile["name"],
+            "center_frequency_hz": center_hz,
+            "span_hz": span_hz,
+            "bins": bins,
+            "noise_floor_dbfs": noise_floor,
+            "peaks": peaks,
+            "points": points,
+            "backend": backend,
+            "bounded": True,
+        },
+    }
+
+
+def spectrum_top(payload):
+    snapshot = spectrum_snapshot(payload)["spectrum"]
+    return {
+        "ok": True,
+        "spectrum": {
+            "profile": snapshot["profile"],
+            "center_frequency_hz": snapshot["center_frequency_hz"],
+            "span_hz": snapshot["span_hz"],
+            "noise_floor_dbfs": snapshot["noise_floor_dbfs"],
+            "peaks": snapshot["peaks"],
+            "backend": snapshot["backend"],
+        },
+    }
+
+
+def loopback_status():
+    state = load_loopback_state()
+    return {
+        "ok": True,
+        "loopback": {
+            "state": state.get("state", "idle"),
+            "profile": state.get("profile"),
+            "frequency_hz": state.get("frequency_hz"),
+            "duration_seconds": state.get("duration_seconds"),
+            "tx_gain_db": state.get("tx_gain_db"),
+            "tx_tone_hz": state.get("tx_tone_hz"),
+            "tx_amplitude": state.get("tx_amplitude"),
+            "backend": state.get("backend"),
+            "metrics": state.get("metrics"),
+            "started_utc": state.get("started_utc"),
+            "completed_utc": state.get("completed_utc"),
+            "last_error": state.get("last_error"),
+            "max_duration_seconds": LOOPBACK_MAX_SECONDS,
+            "max_tx_amplitude": LOOPBACK_MAX_TX_AMPLITUDE,
+        },
+    }
+
+
+def tx_confirmation(payload):
+    value = payload.get("confirm_live_tx")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "on", "i_understand_this_transmits_rf"}
+    return False
+
+
+def validate_loopback(payload):
+    profile = get_profile(payload.get("profile", "LOOPBACK_TEST"))
+    if not profile.get("tx_allowed"):
+        raise ApiError(
+            "tx_not_allowed",
+            "profile is not enabled for TX loopback",
+            status=403,
+            details={"profile": profile["name"]},
+        )
+    profile_limit = int(profile.get("loopback_duration_limit_seconds") or LOOPBACK_MAX_SECONDS)
+    duration_max = max(1, min(profile_limit, LOOPBACK_MAX_SECONDS))
+    duration_seconds = validate_uint(payload.get("duration_seconds", duration_max), "duration_seconds", 1, duration_max)
+    frequency_hz = validate_uint(
+        payload.get("frequency_hz", profile["default_frequency_hz"]),
+        "frequency_hz",
+        70_000_000,
+        6_000_000_000,
+    )
+    tx_gain_db = validate_decimal(payload.get("tx_gain_db", profile.get("tx_gain_db", -30.0)), "tx_gain_db", -89.75, 0.0)
+    tx_tone_hz = validate_uint(payload.get("tx_tone_hz", profile.get("tx_tone_hz", 10000)), "tx_tone_hz", 100, 200000)
+    tx_amplitude = validate_decimal(
+        payload.get("tx_amplitude", profile.get("tx_amplitude", 0.05)),
+        "tx_amplitude",
+        0.0,
+        LOOPBACK_MAX_TX_AMPLITUDE,
+    )
+    sample_rate_hz = validate_uint(
+        payload.get("sample_rate_hz", profile["sample_rate_hz"]),
+        "sample_rate_hz",
+        520_000,
+        61_440_000,
+    )
+    if tx_tone_hz >= sample_rate_hz // 4:
+        raise ApiError(
+            "invalid_loopback_tone",
+            "tx_tone_hz must be below one quarter of sample_rate_hz",
+            details={"tx_tone_hz": tx_tone_hz, "sample_rate_hz": sample_rate_hz},
+        )
+    return {
+        "profile": profile,
+        "frequency_hz": frequency_hz,
+        "duration_seconds": duration_seconds,
+        "tx_gain_db": tx_gain_db,
+        "tx_tone_hz": tx_tone_hz,
+        "tx_amplitude": tx_amplitude,
+        "sample_rate_hz": sample_rate_hz,
+        "rf_bandwidth_hz": profile["rf_bandwidth_hz"],
+        "gain_db": profile["gain_db"],
+    }
+
+
+def apply_loopback_config(plan):
+    profile = plan["profile"]
+    apply_profile(
+        {
+            "profile": profile["name"],
+            "frequency_hz": plan["frequency_hz"],
+            "gain_db": plan["gain_db"],
+            "gain_control_mode": profile["gain_control_mode"],
+        }
+    )
+    device = find_iio_device()
+    writes = [
+        write_attr(device, "out_altvoltage1_TX_LO_frequency", plan["frequency_hz"], required=True),
+        write_attr(device, "out_voltage_rf_bandwidth", plan["rf_bandwidth_hz"], required=True),
+        write_attr(device, "out_voltage_sampling_frequency", plan["sample_rate_hz"], required=True),
+        write_attr(device, "out_voltage0_hardwaregain", plan["tx_gain_db"], required=True),
+        write_attr(device, "out_voltage1_hardwaregain", plan["tx_gain_db"]),
+        write_attr(device, "ensm_mode", "fdd"),
+    ]
+    return writes
+
+
+def simulated_loopback_metrics(plan):
+    noise = -82.0
+    tone = -38.0 + (float(plan["tx_amplitude"]) * 20.0)
+    return {
+        "ok": True,
+        "samples": int(plan["duration_seconds"] * plan["sample_rate_hz"]),
+        "duration_ms": int(plan["duration_seconds"] * 1000),
+        "sample_rate_hz": plan["sample_rate_hz"],
+        "tone_hz": plan["tx_tone_hz"],
+        "tx_amplitude": plan["tx_amplitude"],
+        "rx_rms_dbfs": round(tone, 2),
+        "rx_peak_dbfs": round(tone + 8.0, 2),
+        "noise_floor_dbfs": noise,
+        "simulated": True,
+    }
+
+
+def start_loopback(payload):
+    plan = validate_loopback(payload)
+    simulate = dry_run() or str(payload.get("simulate", "")).lower() in {"1", "true", "yes"}
+    if not simulate and not tx_confirmation(payload):
+        raise ApiError(
+            "tx_confirmation_required",
+            "set confirm_live_tx=true to run a bounded live RF loopback test",
+            status=403,
+        )
+
+    started = now_utc()
+    save_loopback_state(
+        state="running",
+        profile=plan["profile"]["name"],
+        frequency_hz=plan["frequency_hz"],
+        duration_seconds=plan["duration_seconds"],
+        tx_gain_db=plan["tx_gain_db"],
+        tx_tone_hz=plan["tx_tone_hz"],
+        tx_amplitude=plan["tx_amplitude"],
+        backend="simulated" if simulate else "external",
+        started_utc=started,
+        completed_utc=None,
+        metrics=None,
+        last_error=None,
+    )
+
+    if simulate:
+        metrics = simulated_loopback_metrics(plan)
+        writes = [{"status": "dry_run" if dry_run() else "simulated"}]
+    else:
+        if not LOOPBACK_BACKEND.is_file() or not os.access(str(LOOPBACK_BACKEND), os.X_OK):
+            message = f"loopback backend is not installed: {LOOPBACK_BACKEND}"
+            save_loopback_state(
+                state="error",
+                last_error={"code": "loopback_backend_missing", "message": message, "time_utc": now_utc()},
+            )
+            raise ApiError("loopback_backend_missing", message, status=503)
+        writes = apply_loopback_config(plan)
+        env = os.environ.copy()
+        env.update(
+            {
+                "PLUTO_LOOPBACK_DURATION_MS": str(plan["duration_seconds"] * 1000),
+                "PLUTO_LOOPBACK_SAMPLE_RATE_HZ": str(plan["sample_rate_hz"]),
+                "PLUTO_LOOPBACK_TONE_HZ": str(plan["tx_tone_hz"]),
+                "PLUTO_LOOPBACK_TX_AMPLITUDE": str(plan["tx_amplitude"]),
+            }
+        )
+        proc = subprocess.run(
+            [str(LOOPBACK_BACKEND)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=plan["duration_seconds"] + 5,
+        )
+        try:
+            write_attr(find_iio_device(), "ensm_mode", "alert")
+        except Exception:
+            pass
+        if proc.returncode != 0:
+            message = (proc.stderr or "loopback backend failed").strip()
+            save_loopback_state(
+                state="error",
+                last_error={"code": "loopback_failed", "message": message, "time_utc": now_utc()},
+            )
+            raise ApiError("loopback_failed", message, status=503, details={"returncode": proc.returncode})
+        try:
+            metrics = json.loads(proc.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise ApiError("loopback_backend_json", str(exc), status=503)
+
+    completed = save_loopback_state(
+        state="complete",
+        completed_utc=now_utc(),
+        metrics=metrics,
+        last_error=None,
+    )
+    return {"ok": True, "loopback": completed, "writes": writes, "bounded": True}
+
+
+def tx_status():
+    state = load_tx_state()
+    return {
+        "ok": True,
+        "tx": {
+            "state": state.get("state", "idle"),
+            "profile": state.get("profile"),
+            "frequency_hz": state.get("frequency_hz"),
+            "duration_seconds": state.get("duration_seconds"),
+            "tx_mode": state.get("tx_mode"),
+            "tx_gain_db": state.get("tx_gain_db"),
+            "tx_tone_hz": state.get("tx_tone_hz"),
+            "tx_amplitude": state.get("tx_amplitude"),
+            "tx_audio_source": state.get("tx_audio_source"),
+            "tx_audio_path": state.get("tx_audio_path"),
+            "tx_audio_rate_hz": state.get("tx_audio_rate_hz"),
+            "tx_audio_tone_hz": state.get("tx_audio_tone_hz"),
+            "tx_am_modulation_index": state.get("tx_am_modulation_index"),
+            "tx_fm_deviation_hz": state.get("tx_fm_deviation_hz"),
+            "tx_cw_text": state.get("tx_cw_text"),
+            "tx_cw_wpm": state.get("tx_cw_wpm"),
+            "backend": state.get("backend"),
+            "metrics": state.get("metrics"),
+            "started_utc": state.get("started_utc"),
+            "completed_utc": state.get("completed_utc"),
+            "last_error": state.get("last_error"),
+            "max_duration_seconds": TX_MAX_SECONDS,
+            "max_tx_amplitude": TX_MAX_TX_AMPLITUDE,
+        },
+    }
+
+
+def validate_tx(payload):
+    profile = get_profile(payload.get("profile", "TX_TEST_TONE"))
+    if not profile.get("tx_allowed"):
+        raise ApiError(
+            "tx_not_allowed",
+            "profile is not enabled for TX",
+            status=403,
+            details={"profile": profile["name"]},
+        )
+    profile_limit = int(profile.get("tx_duration_limit_seconds") or TX_MAX_SECONDS)
+    duration_max = max(1, min(profile_limit, TX_MAX_SECONDS))
+    duration_seconds = validate_uint(payload.get("duration_seconds", duration_max), "duration_seconds", 1, duration_max)
+    frequency_hz = validate_uint(
+        payload.get("frequency_hz", profile["default_frequency_hz"]),
+        "frequency_hz",
+        70_000_000,
+        6_000_000_000,
+    )
+    tx_mode = payload.get("tx_mode", profile.get("tx_mode", "tone"))
+    if tx_mode not in TX_MODES:
+        raise ApiError("invalid_value", "tx_mode is invalid", details={"tx_mode": tx_mode})
+    default_tone = 0 if tx_mode in {"carrier", "am", "fm", "cw"} else profile.get("tx_tone_hz", 10000)
+    tx_tone_hz = validate_uint(payload.get("tx_tone_hz", default_tone), "tx_tone_hz", 0, 200000)
+    if tx_mode == "tone" and tx_tone_hz < 100:
+        raise ApiError("invalid_tx_tone", "tone TX requires tx_tone_hz >= 100", details={"tx_tone_hz": tx_tone_hz})
+    if tx_mode in {"carrier", "am", "fm", "cw"}:
+        tx_tone_hz = 0
+    tx_audio_source = payload.get("tx_audio_source", profile.get("tx_audio_source", "tone"))
+    if tx_audio_source not in TX_AUDIO_SOURCES:
+        raise ApiError("invalid_value", "tx_audio_source is invalid", details={"tx_audio_source": tx_audio_source})
+    tx_audio_path = payload.get("tx_audio_path", profile.get("tx_audio_path", ""))
+    if tx_audio_source == "file":
+        tx_audio_path = validate_tx_audio_path(tx_audio_path)
+    else:
+        tx_audio_path = ""
+    tx_audio_rate_hz = validate_uint(
+        payload.get("tx_audio_rate_hz", profile.get("tx_audio_rate_hz", 8000)), "tx_audio_rate_hz", 8000, 48000
+    )
+    tx_audio_tone_hz = validate_uint(
+        payload.get("tx_audio_tone_hz", profile.get("tx_audio_tone_hz", 1000)), "tx_audio_tone_hz", 20, 3000
+    )
+    tx_am_modulation_index = validate_decimal(
+        payload.get("tx_am_modulation_index", profile.get("tx_am_modulation_index", 0.8)),
+        "tx_am_modulation_index",
+        0.0,
+        1.0,
+    )
+    tx_fm_deviation_hz = validate_uint(
+        payload.get("tx_fm_deviation_hz", profile.get("tx_fm_deviation_hz", 5000)), "tx_fm_deviation_hz", 100, 25000
+    )
+    tx_cw_text = validate_cw_text(payload.get("tx_cw_text", profile.get("tx_cw_text", "CQ PLUTO")))
+    tx_cw_wpm = validate_uint(payload.get("tx_cw_wpm", profile.get("tx_cw_wpm", 12)), "tx_cw_wpm", 5, 40)
+    tx_gain_db = validate_decimal(payload.get("tx_gain_db", profile.get("tx_gain_db", -30.0)), "tx_gain_db", -89.75, 0.0)
+    tx_amplitude = validate_decimal(
+        payload.get("tx_amplitude", profile.get("tx_amplitude", 0.05)),
+        "tx_amplitude",
+        0.0,
+        TX_MAX_TX_AMPLITUDE,
+    )
+    sample_rate_hz = validate_uint(
+        payload.get("sample_rate_hz", profile["sample_rate_hz"]),
+        "sample_rate_hz",
+        520_000,
+        61_440_000,
+        )
+    if tx_tone_hz and tx_tone_hz >= sample_rate_hz // 4:
+        raise ApiError(
+            "invalid_tx_tone",
+            "tx_tone_hz must be below one quarter of sample_rate_hz",
+            details={"tx_tone_hz": tx_tone_hz, "sample_rate_hz": sample_rate_hz},
+        )
+    if tx_mode in {"am", "fm"} and tx_audio_source == "file" and not tx_audio_path:
+        raise ApiError("invalid_audio_path", "tx_audio_path is required for file audio source")
+    if tx_fm_deviation_hz >= sample_rate_hz // 8:
+        raise ApiError(
+            "invalid_fm_deviation",
+            "tx_fm_deviation_hz must be below one eighth of sample_rate_hz",
+            details={"tx_fm_deviation_hz": tx_fm_deviation_hz, "sample_rate_hz": sample_rate_hz},
+        )
+    return {
+        "profile": profile,
+        "frequency_hz": frequency_hz,
+        "duration_seconds": duration_seconds,
+        "tx_mode": tx_mode,
+        "tx_gain_db": tx_gain_db,
+        "tx_tone_hz": tx_tone_hz,
+        "tx_amplitude": tx_amplitude,
+        "tx_audio_source": tx_audio_source,
+        "tx_audio_path": tx_audio_path,
+        "tx_audio_rate_hz": tx_audio_rate_hz,
+        "tx_audio_tone_hz": tx_audio_tone_hz,
+        "tx_am_modulation_index": tx_am_modulation_index,
+        "tx_fm_deviation_hz": tx_fm_deviation_hz,
+        "tx_cw_text": tx_cw_text,
+        "tx_cw_wpm": tx_cw_wpm,
+        "sample_rate_hz": sample_rate_hz,
+        "rf_bandwidth_hz": profile["rf_bandwidth_hz"],
+        "gain_db": profile["gain_db"],
+    }
+
+
+def tx_guardrail_bounds():
+    return {
+        "frequency_hz": {"min": 70_000_000, "max": 6_000_000_000},
+        "sample_rate_hz": {"min": 520_000, "max": 61_440_000},
+        "rf_bandwidth_hz": {"min": 200_000, "max": 56_000_000},
+        "tx_gain_db": {"min": -89.75, "max": 0.0},
+        "tx_amplitude": {"min": 0.0, "max": TX_MAX_TX_AMPLITUDE},
+        "duration_seconds": {"min": 1, "max": TX_MAX_SECONDS},
+        "tx_tone_hz": {"min": 100, "max": 200_000, "limit": "below sample_rate_hz / 4"},
+        "tx_audio_rate_hz": {"min": 8_000, "max": 48_000},
+        "tx_audio_tone_hz": {"min": 20, "max": 3_000},
+        "tx_am_modulation_index": {"min": 0.0, "max": 1.0},
+        "tx_fm_deviation_hz": {"min": 100, "max": 25_000, "limit": "below sample_rate_hz / 8"},
+        "tx_cw_wpm": {"min": 5, "max": 40},
+        "tx_cw_text": {"max_chars": 80, "allowed": "A-Z a-z 0-9 space . , ? / + -"},
+        "tx_modes": sorted(TX_MODES),
+        "tx_audio_sources": sorted(TX_AUDIO_SOURCES),
+        "tx_audio_safe_roots": [root.rstrip("/") for root in TX_AUDIO_SAFE_ROOTS],
+        "live_tx_confirmation": "confirm_live_tx=true",
+    }
+
+
+def tx_plan_summary(plan):
+    return {
+        "profile": plan["profile"]["name"],
+        "frequency_hz": plan["frequency_hz"],
+        "duration_seconds": plan["duration_seconds"],
+        "tx_mode": plan["tx_mode"],
+        "tx_gain_db": plan["tx_gain_db"],
+        "tx_tone_hz": plan["tx_tone_hz"],
+        "tx_amplitude": plan["tx_amplitude"],
+        "tx_audio_source": plan["tx_audio_source"],
+        "tx_audio_path": plan["tx_audio_path"],
+        "tx_audio_rate_hz": plan["tx_audio_rate_hz"],
+        "tx_audio_tone_hz": plan["tx_audio_tone_hz"],
+        "tx_am_modulation_index": plan["tx_am_modulation_index"],
+        "tx_fm_deviation_hz": plan["tx_fm_deviation_hz"],
+        "tx_cw_text": plan["tx_cw_text"],
+        "tx_cw_wpm": plan["tx_cw_wpm"],
+        "sample_rate_hz": plan["sample_rate_hz"],
+        "rf_bandwidth_hz": plan["rf_bandwidth_hz"],
+    }
+
+
+def tx_readiness(payload=None):
+    payload = payload or {}
+    blockers = []
+    warnings = []
+    plan = None
+    try:
+        plan = validate_tx(payload) if payload else None
+    except ApiError as exc:
+        blockers.append({"code": exc.code, "message": exc.message, "details": exc.details})
+
+    attrs = current_radio_attrs()
+    radio_present = attrs.get("radio_present", False)
+    backend = tx_backend_path()
+    backend_available = backend.is_file() and os.access(str(backend), os.X_OK)
+    simulate = dry_run() or str(payload.get("simulate", "")).lower() in {"1", "true", "yes"}
+    confirmation = tx_confirmation(payload) if payload else False
+
+    if not radio_present:
+        warnings.append({"code": "radio_not_detected", "message": "AD936x IIO device is not visible"})
+    if not backend_available:
+        warnings.append({"code": "tx_backend_missing", "message": str(backend)})
+    if payload and not simulate and not confirmation:
+        blockers.append(
+            {
+                "code": "tx_confirmation_required",
+                "message": "set confirm_live_tx=true to run bounded live RF TX",
+            }
+        )
+
+    return {
+        "profile": plan["profile"]["name"] if plan else payload.get("profile"),
+        "simulation_ready": plan is not None,
+        "live_ready": plan is not None and radio_present and backend_available and confirmation,
+        "radio_present": radio_present,
+        "tx_backend": str(backend),
+        "tx_backend_available": backend_available,
+        "confirmation_required": bool(payload and not simulate),
+        "confirmed": confirmation,
+        "simulate": simulate,
+        "blockers": blockers,
+        "warnings": warnings,
+    }
+
+
+def tx_guardrails(payload=None):
+    payload = payload or {}
+    plan = None
+    error = None
+    try:
+        if payload:
+            plan = tx_plan_summary(validate_tx(payload))
+    except ApiError as exc:
+        error = {"code": exc.code, "message": exc.message, "details": exc.details}
+    readiness = tx_readiness(payload)
+    return {
+        "ok": error is None,
+        "guardrails": tx_guardrail_bounds(),
+        "plan": plan,
+        "readiness": readiness,
+        "error": error,
+    }
+
+
+def calibration_status():
+    state = load_calibration_state()
+    calibration = {
+        "rx_frequency_offset_hz": float(state.get("rx_frequency_offset_hz", 0.0)),
+        "tx_frequency_offset_hz": float(state.get("tx_frequency_offset_hz", 0.0)),
+        "rx_gain_offset_db": float(state.get("rx_gain_offset_db", 0.0)),
+        "tx_gain_offset_db": float(state.get("tx_gain_offset_db", 0.0)),
+        "notes": state.get("notes", ""),
+        "updated_utc": state.get("updated_utc"),
+    }
+    return {
+        "ok": True,
+        "calibration": calibration,
+        "guardrails": tx_guardrail_bounds(),
+        "readiness": tx_readiness({"profile": "TX_TEST_TONE", "simulate": "true"}),
+    }
+
+
+def apply_calibration(payload):
+    current = load_calibration_state()
+    calibration = {
+        "rx_frequency_offset_hz": validate_optional_decimal(
+            payload, "rx_frequency_offset_hz", current.get("rx_frequency_offset_hz", 0.0), -250_000.0, 250_000.0
+        ),
+        "tx_frequency_offset_hz": validate_optional_decimal(
+            payload, "tx_frequency_offset_hz", current.get("tx_frequency_offset_hz", 0.0), -250_000.0, 250_000.0
+        ),
+        "rx_gain_offset_db": validate_optional_decimal(
+            payload, "rx_gain_offset_db", current.get("rx_gain_offset_db", 0.0), -20.0, 20.0
+        ),
+        "tx_gain_offset_db": validate_optional_decimal(
+            payload, "tx_gain_offset_db", current.get("tx_gain_offset_db", 0.0), -20.0, 20.0
+        ),
+        "notes": validate_notes(payload.get("notes", current.get("notes", ""))),
+    }
+    saved = save_calibration_state(**calibration)
+    return {"ok": True, "calibration": saved, "applied_to_hardware": False}
+
+
+def tx_backend_path():
+    if TX_BACKEND.is_file() and os.access(str(TX_BACKEND), os.X_OK):
+        return TX_BACKEND
+    if LOOPBACK_BACKEND.is_file() and os.access(str(LOOPBACK_BACKEND), os.X_OK):
+        return LOOPBACK_BACKEND
+    return TX_BACKEND
+
+
+def apply_tx_config(plan):
+    profile = plan["profile"]
+    apply_profile(
+        {
+            "profile": profile["name"],
+            "frequency_hz": plan["frequency_hz"],
+            "gain_db": plan["gain_db"],
+            "gain_control_mode": profile["gain_control_mode"],
+        }
+    )
+    device = find_iio_device()
+    writes = [
+        write_attr(device, "out_altvoltage1_TX_LO_frequency", plan["frequency_hz"], required=True),
+        write_attr(device, "out_voltage_rf_bandwidth", plan["rf_bandwidth_hz"], required=True),
+        write_attr(device, "out_voltage_sampling_frequency", plan["sample_rate_hz"], required=True),
+        write_attr(device, "out_voltage0_hardwaregain", plan["tx_gain_db"], required=True),
+        write_attr(device, "out_voltage1_hardwaregain", plan["tx_gain_db"]),
+        write_attr(device, "ensm_mode", "fdd"),
+    ]
+    return writes
+
+
+def simulated_tx_metrics(plan):
+    return {
+        "ok": True,
+        "mode": "tx_only",
+        "tx_mode": plan["tx_mode"],
+        "duration_ms": int(plan["duration_seconds"] * 1000),
+        "sample_rate_hz": plan["sample_rate_hz"],
+        "tone_hz": plan["tx_tone_hz"],
+        "tx_amplitude": plan["tx_amplitude"],
+        "tx_audio_source": plan["tx_audio_source"],
+        "tx_audio_path": plan["tx_audio_path"],
+        "tx_audio_rate_hz": plan["tx_audio_rate_hz"],
+        "tx_audio_tone_hz": plan["tx_audio_tone_hz"],
+        "tx_am_modulation_index": plan["tx_am_modulation_index"],
+        "tx_fm_deviation_hz": plan["tx_fm_deviation_hz"],
+        "tx_cw_text": plan["tx_cw_text"],
+        "tx_cw_wpm": plan["tx_cw_wpm"],
+        "simulated": True,
+    }
+
+
+def start_tx(payload):
+    plan = validate_tx(payload)
+    simulate = dry_run() or str(payload.get("simulate", "")).lower() in {"1", "true", "yes"}
+    if not simulate and not tx_confirmation(payload):
+        raise ApiError(
+            "tx_confirmation_required",
+            "set confirm_live_tx=true to run bounded live RF TX",
+            status=403,
+        )
+
+    started = now_utc()
+    save_tx_state(
+        state="running",
+        profile=plan["profile"]["name"],
+        frequency_hz=plan["frequency_hz"],
+        duration_seconds=plan["duration_seconds"],
+        tx_mode=plan["tx_mode"],
+        tx_gain_db=plan["tx_gain_db"],
+        tx_tone_hz=plan["tx_tone_hz"],
+        tx_amplitude=plan["tx_amplitude"],
+        tx_audio_source=plan["tx_audio_source"],
+        tx_audio_path=plan["tx_audio_path"],
+        tx_audio_rate_hz=plan["tx_audio_rate_hz"],
+        tx_audio_tone_hz=plan["tx_audio_tone_hz"],
+        tx_am_modulation_index=plan["tx_am_modulation_index"],
+        tx_fm_deviation_hz=plan["tx_fm_deviation_hz"],
+        tx_cw_text=plan["tx_cw_text"],
+        tx_cw_wpm=plan["tx_cw_wpm"],
+        backend="simulated" if simulate else "external",
+        started_utc=started,
+        completed_utc=None,
+        metrics=None,
+        last_error=None,
+    )
+
+    if simulate:
+        metrics = simulated_tx_metrics(plan)
+        writes = [{"status": "dry_run" if dry_run() else "simulated"}]
+    else:
+        backend = tx_backend_path()
+        if not backend.is_file() or not os.access(str(backend), os.X_OK):
+            message = f"TX backend is not installed: {backend}"
+            save_tx_state(
+                state="error",
+                last_error={"code": "tx_backend_missing", "message": message, "time_utc": now_utc()},
+            )
+            raise ApiError("tx_backend_missing", message, status=503)
+        if plan["tx_audio_source"] == "file" and not Path(plan["tx_audio_path"]).exists():
+            message = f"TX audio path does not exist: {plan['tx_audio_path']}"
+            save_tx_state(
+                state="error",
+                last_error={"code": "tx_audio_missing", "message": message, "time_utc": now_utc()},
+            )
+            raise ApiError("tx_audio_missing", message, status=404)
+        writes = apply_tx_config(plan)
+        env = os.environ.copy()
+        env.update(
+            {
+                "PLUTO_TX_MODE": plan["tx_mode"],
+                "PLUTO_TX_ONLY": "1",
+                "PLUTO_LOOPBACK_DURATION_MS": str(plan["duration_seconds"] * 1000),
+                "PLUTO_LOOPBACK_SAMPLE_RATE_HZ": str(plan["sample_rate_hz"]),
+                "PLUTO_LOOPBACK_TONE_HZ": str(plan["tx_tone_hz"]),
+                "PLUTO_LOOPBACK_TX_AMPLITUDE": str(plan["tx_amplitude"]),
+                "PLUTO_TX_AUDIO_SOURCE": plan["tx_audio_source"],
+                "PLUTO_TX_AUDIO_PATH": plan["tx_audio_path"],
+                "PLUTO_TX_AUDIO_RATE_HZ": str(plan["tx_audio_rate_hz"]),
+                "PLUTO_TX_AUDIO_TONE_HZ": str(plan["tx_audio_tone_hz"]),
+                "PLUTO_TX_AM_INDEX": str(plan["tx_am_modulation_index"]),
+                "PLUTO_TX_FM_DEVIATION_HZ": str(plan["tx_fm_deviation_hz"]),
+                "PLUTO_TX_CW_TEXT": plan["tx_cw_text"],
+                "PLUTO_TX_CW_WPM": str(plan["tx_cw_wpm"]),
+            }
+        )
+        proc = subprocess.run(
+            [str(backend)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=plan["duration_seconds"] + 5,
+        )
+        try:
+            write_attr(find_iio_device(), "ensm_mode", "alert")
+        except Exception:
+            pass
+        if proc.returncode != 0:
+            message = (proc.stderr or "TX backend failed").strip()
+            save_tx_state(
+                state="error",
+                last_error={"code": "tx_failed", "message": message, "time_utc": now_utc()},
+            )
+            raise ApiError("tx_failed", message, status=503, details={"returncode": proc.returncode})
+        try:
+            metrics = json.loads(proc.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise ApiError("tx_backend_json", str(exc), status=503)
+
+    completed = save_tx_state(
+        state="complete",
+        completed_utc=now_utc(),
+        metrics=metrics,
+        last_error=None,
+    )
+    return {"ok": True, "tx": completed, "writes": writes, "bounded": True}
+
+
+def stop_tx():
+    writes = []
+    if dry_run():
+        writes.append({"status": "dry_run", "attr": "ensm_mode", "value": "alert"})
+    else:
+        try:
+            writes.append(write_attr(find_iio_device(), "ensm_mode", "alert"))
+        except ApiError:
+            raise
+        except Exception as exc:
+            raise ApiError("tx_stop_failed", str(exc), status=503)
+    state = save_tx_state(state="stopped", completed_utc=now_utc(), last_error=None)
+    return {"ok": True, "tx": state, "writes": writes}
+
+
+def self_test_step(name, func, required=True):
+    try:
+        result = func()
+        ok = result.get("ok", True) if isinstance(result, dict) else True
+        return {"name": name, "ok": bool(ok), "required": required, "result": result}
+    except ApiError as exc:
+        return {
+            "name": name,
+            "ok": False,
+            "required": required,
+            "error": {"code": exc.code, "message": exc.message, "details": exc.details},
+        }
+    except Exception as exc:
+        return {"name": name, "ok": False, "required": required, "error": {"code": "internal_error", "message": str(exc)}}
+
+
+def self_test(payload=None):
+    payload = payload or {}
+    require_radio = validate_bool(payload.get("require_radio", False), "require_radio")
+    tx_duration = validate_uint(payload.get("tx_duration_seconds", 1), "tx_duration_seconds", 1, min(3, TX_MAX_SECONDS))
+    steps = [
+        self_test_step("profiles", list_profiles),
+        self_test_step("radio-status", radio_status, required=require_radio),
+        self_test_step("calibration-status", calibration_status),
+        self_test_step("tx-guardrails", lambda: tx_guardrails({"profile": "TX_TEST_TONE", "simulate": "true"})),
+        self_test_step("audio-status", audio_status),
+        self_test_step("watchdog-status", watchdog_status),
+        self_test_step("spectrum-status", spectrum_status),
+        self_test_step("loopback-status", loopback_status),
+        self_test_step("tx-status", tx_status),
+        self_test_step("doppler-status", doppler_status),
+        self_test_step("audio-sim-start", lambda: start_audio({"profile": "NOAA_NFM", "simulate": "true"})),
+        self_test_step("audio-stop", stop_audio),
+        self_test_step(
+            "spectrum-sim-top",
+            lambda: spectrum_top({"profile": "IQ_CAPTURE", "simulate": "true", "bins": 64, "top_n": 3}),
+        ),
+        self_test_step(
+            "loopback-sim",
+            lambda: start_loopback({"profile": "LOOPBACK_TEST", "simulate": "true", "duration_seconds": 1}),
+        ),
+        self_test_step(
+            "tx-sim-tone",
+            lambda: start_tx({"profile": "TX_TEST_TONE", "simulate": "true", "duration_seconds": tx_duration}),
+        ),
+        self_test_step(
+            "tx-sim-am",
+            lambda: start_tx({"profile": "TX_AUDIO_AM", "simulate": "true", "duration_seconds": tx_duration}),
+        ),
+        self_test_step(
+            "tx-sim-fm",
+            lambda: start_tx({"profile": "TX_AUDIO_FM", "simulate": "true", "duration_seconds": tx_duration}),
+        ),
+        self_test_step(
+            "tx-sim-cw",
+            lambda: start_tx(
+                {
+                    "profile": "TX_CW",
+                    "simulate": "true",
+                    "duration_seconds": tx_duration,
+                    "tx_cw_text": "CQ TEST",
+                }
+            ),
+        ),
+        self_test_step("tx-stop", stop_tx),
+    ]
+    required_failures = [step for step in steps if step["required"] and not step["ok"]]
+    optional_failures = [step for step in steps if not step["required"] and not step["ok"]]
+    state = "fail" if required_failures else "warn" if optional_failures else "pass"
+    saved = save_self_test_state(
+        state=state,
+        safe=True,
+        live_tx=False,
+        required_failures=len(required_failures),
+        optional_failures=len(optional_failures),
+        completed_utc=now_utc(),
+    )
+    return {
+        "ok": not required_failures,
+        "self_test": {
+            "state": state,
+            "safe": True,
+            "live_tx": False,
+            "steps": steps,
+            "required_failures": len(required_failures),
+            "optional_failures": len(optional_failures),
+            "last_result": saved,
+        },
+    }
+
+
+def self_test_status():
+    return {"ok": True, "self_test": load_self_test_state()}
+
+
+def parse_utc(value, key):
+    if not isinstance(value, str) or not value:
+        raise ApiError("invalid_time", f"{key} is required", details={key: value})
+    try:
+        normalized = value.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        raise ApiError("invalid_time", f"{key} must be ISO-8601 UTC", details={key: value})
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def utc_epoch_ms(value):
+    return int(parse_utc(value, "time").timestamp() * 1000)
+
+
+def validate_doppler_point(point, index):
+    if not isinstance(point, dict):
+        raise ApiError("invalid_doppler_point", "doppler_table entries must be objects", details={"index": index})
+    offset_ms = validate_uint(point.get("offset_ms"), "offset_ms", 0, 24 * 60 * 60 * 1000)
+    frequency_hz = validate_uint(point.get("frequency_hz"), "frequency_hz", 70_000_000, 6_000_000_000)
+    return {"offset_ms": offset_ms, "frequency_hz": frequency_hz}
+
+
+def validate_doppler_plan(payload):
+    profile = get_profile(payload.get("profile", ""))
+    base_frequency_hz = validate_uint(
+        payload.get("base_frequency_hz", profile["default_frequency_hz"]),
+        "base_frequency_hz",
+        70_000_000,
+        6_000_000_000,
+    )
+    start_utc = payload.get("start_utc")
+    stop_utc = payload.get("stop_utc")
+    if not start_utc:
+        start_utc = now_utc()
+    start_dt = parse_utc(start_utc, "start_utc")
+    if not stop_utc:
+        stop_dt = datetime.fromtimestamp(start_dt.timestamp() + 900, timezone.utc)
+        stop_utc = stop_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    else:
+        stop_dt = parse_utc(stop_utc, "stop_utc")
+    if stop_dt <= start_dt:
+        raise ApiError("invalid_doppler_plan", "stop_utc must be after start_utc")
+    retune_interval_ms = validate_uint(
+        payload.get("retune_interval_ms", 1000),
+        "retune_interval_ms",
+        DOPPLER_MIN_INTERVAL_MS,
+        60_000,
+    )
+    table = payload.get("doppler_table")
+    if not isinstance(table, list) or not table:
+        table = [{"offset_ms": 0, "frequency_hz": base_frequency_hz}]
+    if len(table) > DOPPLER_MAX_POINTS:
+        raise ApiError("doppler_table_too_large", "doppler table exceeds maximum points", details={"max_points": DOPPLER_MAX_POINTS})
+    clean_table = [validate_doppler_point(point, idx) for idx, point in enumerate(table)]
+    clean_table.sort(key=lambda point: point["offset_ms"])
+    return {
+        "profile": profile["name"],
+        "base_frequency_hz": base_frequency_hz,
+        "start_utc": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "stop_utc": stop_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "retune_interval_ms": retune_interval_ms,
+        "doppler_table": clean_table,
+        "point_count": len(clean_table),
+        "start_epoch_ms": int(start_dt.timestamp() * 1000),
+        "stop_epoch_ms": int(stop_dt.timestamp() * 1000),
+    }
+
+
+def doppler_plan(payload):
+    plan = validate_doppler_plan(payload)
+    if dry_run():
+        return {"ok": True, "doppler": {"state": "planned", "plan": plan, "dry_run": True}}
+    save_doppler_state(
+        state="planned",
+        plan=plan,
+        current_index=0,
+        worker_pid=None,
+        last_retune_utc=None,
+        last_error=None,
+    )
+    apply_profile({"profile": plan["profile"], "frequency_hz": plan["base_frequency_hz"]})
+    return doppler_status()
+
+
+def doppler_status():
+    state = load_doppler_state()
+    plan = state.get("plan")
+    worker_pid = state.get("worker_pid")
+    current_index = int(state.get("current_index") or 0)
+    next_point = None
+    if plan:
+        table = plan.get("doppler_table", [])
+        if current_index < len(table):
+            point = table[current_index]
+            next_point = {
+                "offset_ms": point["offset_ms"],
+                "frequency_hz": point["frequency_hz"],
+                "retune_utc": datetime.fromtimestamp((plan["start_epoch_ms"] + point["offset_ms"]) / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+    return {
+        "ok": True,
+        "doppler": {
+            "state": state.get("state", "idle"),
+            "profile": plan.get("profile") if plan else None,
+            "point_count": plan.get("point_count") if plan else 0,
+            "current_index": current_index,
+            "next_point": next_point,
+            "current_frequency_hz": state.get("current_frequency_hz"),
+            "actual_frequency_hz": radio_status()["radio"].get("actual_frequency_hz"),
+            "worker_pid": worker_pid,
+            "worker_alive": process_alive(worker_pid),
+            "last_retune_utc": state.get("last_retune_utc"),
+            "last_error": state.get("last_error"),
+            "max_points": DOPPLER_MAX_POINTS,
+            "min_interval_ms": DOPPLER_MIN_INTERVAL_MS,
+        },
+    }
+
+
+def doppler_start(payload):
+    plan_response = None
+    if payload.get("profile"):
+        plan_response = doppler_plan(payload)
+    state = load_doppler_state()
+    plan = state.get("plan") or (plan_response or {}).get("doppler", {}).get("plan")
+    if not plan:
+        raise ApiError("no_doppler_plan", "load a Doppler plan before starting", status=409)
+    if dry_run():
+        return {"ok": True, "doppler": {"state": "running", "plan": plan, "dry_run": True}}
+    worker_pid = state.get("worker_pid")
+    if process_alive(worker_pid):
+        return doppler_status()
+    if not DOPPLER_WORKER.is_file() or not os.access(str(DOPPLER_WORKER), os.X_OK):
+        raise ApiError("doppler_worker_missing", f"Doppler worker is not installed: {DOPPLER_WORKER}", status=503)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    log = (STATE_DIR / "doppler-worker.log").open("ab")
+    proc = subprocess.Popen([str(DOPPLER_WORKER)], stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+    save_doppler_state(state="running", worker_pid=proc.pid, last_error=None)
+    return doppler_status()
+
+
+def doppler_stop():
+    state = load_doppler_state()
+    pid = state.get("worker_pid")
+    if process_alive(pid) and os.name != "nt":
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except OSError:
+            pass
+    if dry_run():
+        return {"ok": True, "doppler": {"state": "stopped", "dry_run": True}}
+    save_doppler_state(state="stopped", worker_pid=None)
+    return doppler_status()
+
+
+def doppler_tick(payload=None):
+    payload = payload or {}
+    if dry_run() and payload.get("profile"):
+        plan = validate_doppler_plan(payload)
+        return {"ok": True, "doppler": {"state": "running", "plan": plan, "dry_run": True}, "applied": None}
+    state = load_doppler_state()
+    plan = state.get("plan")
+    if not plan:
+        raise ApiError("no_doppler_plan", "no Doppler plan is loaded", status=409)
+    now_ms = int(payload.get("now_ms") or time.time() * 1000)
+    if now_ms >= plan["stop_epoch_ms"]:
+        if not dry_run():
+            save_doppler_state(state="complete", worker_pid=None)
+        return doppler_status()
+
+    table = plan.get("doppler_table", [])
+    current_index = int(state.get("current_index") or 0)
+    applied = None
+    while current_index < len(table) and now_ms >= plan["start_epoch_ms"] + table[current_index]["offset_ms"]:
+        applied = table[current_index]
+        current_index += 1
+    if applied:
+        tune({"frequency_hz": applied["frequency_hz"]})
+        updates = {
+            "state": "running",
+            "current_index": current_index,
+            "current_frequency_hz": applied["frequency_hz"],
+            "last_retune_utc": now_utc(),
+            "last_error": None,
+        }
+        if not dry_run():
+            save_doppler_state(**updates)
+        return {"ok": True, "doppler": doppler_status()["doppler"], "applied": applied}
+
+    return {"ok": True, "doppler": doppler_status()["doppler"], "applied": None}
+
+
+def wav_header(data_bytes, rate):
+    channels = 1
+    bits = 16
+    byte_rate = rate * channels * bits // 8
+    block_align = channels * bits // 8
+    return (
+        b"RIFF"
+        + int(36 + data_bytes).to_bytes(4, "little")
+        + b"WAVEfmt "
+        + int(16).to_bytes(4, "little")
+        + int(1).to_bytes(2, "little")
+        + int(channels).to_bytes(2, "little")
+        + int(rate).to_bytes(4, "little")
+        + int(byte_rate).to_bytes(4, "little")
+        + int(block_align).to_bytes(2, "little")
+        + int(bits).to_bytes(2, "little")
+        + b"data"
+        + int(data_bytes).to_bytes(4, "little")
+    )
+
+
+def tail_lines(path, max_lines):
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return None
+    return [line.rstrip("\n") for line in lines[-max_lines:]]
+
+
+def dmesg_lines(max_lines):
+    if os.name == "nt":
+        return None
+    try:
+        proc = subprocess.run(["dmesg"], check=False, capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.splitlines()[-max_lines:]
+
+
+def system_logs(params):
+    max_lines = validate_uint(params.get("lines", 100), "lines", 1, 500)
+    source = params.get("source", "messages")
+    if source == "dmesg":
+        lines = dmesg_lines(max_lines)
+        available = lines is not None
+    elif source in LOG_FILES:
+        path = LOG_FILES[source]
+        lines = tail_lines(path, max_lines)
+        available = lines is not None
+    else:
+        raise ApiError("invalid_log_source", "unknown log source", details={"source": source})
+    return {
+        "ok": True,
+        "logs": {
+            "source": source,
+            "available": available,
+            "lines": lines or [],
+            "line_count": len(lines or []),
+        },
+    }
+
+
+def meminfo():
+    values = {}
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                parts = line.split()
+                if parts:
+                    values[parts[0].rstrip(":").lower() + "_kb"] = int(parts[1])
+    except OSError:
+        pass
+    return values
+
+
+def disk_usage(path):
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return None
+    return {"total_bytes": usage.total, "used_bytes": usage.used, "free_bytes": usage.free}
+
+
+def system_health():
+    try:
+        uptime_seconds = int(float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0]))
+    except OSError:
+        uptime_seconds = None
+    versions = ""
+    try:
+        versions = Path("/opt/VERSIONS").read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    status = radio_status()
+    return {
+        "ok": True,
+        "system": {
+            "hostname": os.uname().nodename if hasattr(os, "uname") else socket.gethostname(),
+            "uptime_seconds": uptime_seconds,
+            "loadavg": os.getloadavg() if hasattr(os, "getloadavg") else None,
+            "meminfo": meminfo(),
+            "storage": {"/": disk_usage("/"), "/mnt/jffs2": disk_usage("/mnt/jffs2")},
+            "firmware_versions": versions,
+            "api_mode": "busybox-httpd-cgi",
+            "api_version": "0.1",
+        },
+        "radio": status["radio"],
+        "audio": audio_status()["audio"],
+        "watchdog": watchdog_status()["watchdog"],
+        "loopback": loopback_status()["loopback"],
+        "tx": tx_status()["tx"],
+        "tx_guardrails": tx_guardrails()["guardrails"],
+        "tx_readiness": tx_readiness({"profile": "TX_TEST_TONE", "simulate": "true"}),
+        "calibration": calibration_status()["calibration"],
+        "self_test": self_test_status()["self_test"],
+        "doppler": doppler_status()["doppler"],
+        "iio": status["iio"],
+    }
+
+
+def cgi_path():
+    params = query_params()
+    path = os.environ.get("PATH_INFO") or params.get("path") or params.get("op") or ""
+    if path and not path.startswith("/"):
+        path = "/" + path
+    return path
+
+
+def route(method, path, payload):
+    if method == "GET" and path in {"/radio/status", "/status"}:
+        return radio_status()
+    if method == "GET" and path in {"/radio/profile/list", "/profiles"}:
+        return list_profiles()
+    if method == "GET" and path in {"/system/health", "/health"}:
+        return system_health()
+    if method == "GET" and path in {"/system/logs", "/logs"}:
+        return system_logs(payload)
+    if method == "GET" and path in {"/system/watchdog", "/watchdog"}:
+        return watchdog_status()
+    if method == "GET" and path in {"/capture/list", "/captures"}:
+        return capture_list(payload)
+    if method == "GET" and path in {"/capture/metadata", "/capture/meta"}:
+        return capture_metadata(payload)
+    if method == "GET" and path in {"/radio/spectrum/status", "/spectrum/status"}:
+        return spectrum_status()
+    if method == "GET" and path in {"/radio/doppler/status", "/doppler/status"}:
+        return doppler_status()
+    if method == "GET" and path in {"/radio/loopback/status", "/loopback/status"}:
+        return loopback_status()
+    if method == "GET" and path in {"/radio/tx/status", "/tx/status"}:
+        return tx_status()
+    if method == "GET" and path in {"/radio/tx/guardrails", "/tx/guardrails"}:
+        return tx_guardrails(payload)
+    if method == "GET" and path in {"/radio/calibration/status", "/calibration/status"}:
+        return calibration_status()
+    if method == "GET" and path in {"/system/self-test/status", "/self-test/status"}:
+        return self_test_status()
+    if method == "GET" and path in {"/radio/audio/status", "/audio/status"}:
+        return audio_status()
+    if method == "POST" and path in {"/radio/profile/apply", "/apply"}:
+        return apply_profile(payload)
+    if method == "POST" and path in {"/radio/tune", "/tune"}:
+        return tune(payload)
+    if method == "POST" and path in {"/radio/stop", "/stop"}:
+        return stop_radio()
+    if method == "POST" and path in {"/radio/audio/start", "/audio/start"}:
+        return start_audio(payload)
+    if method == "POST" and path in {"/radio/audio/stop", "/audio/stop"}:
+        return stop_audio()
+    if method == "POST" and path in {"/system/watchdog/check", "/watchdog/check"}:
+        return watchdog_check(payload)
+    if method == "POST" and path in {"/capture/start", "/capture"}:
+        return start_capture(payload)
+    if method == "POST" and path in {"/capture/delete"}:
+        return delete_capture(payload)
+    if method == "POST" and path in {"/radio/spectrum/snapshot", "/spectrum/snapshot"}:
+        return spectrum_snapshot(payload)
+    if method == "POST" and path in {"/radio/spectrum/top", "/spectrum/top"}:
+        return spectrum_top(payload)
+    if method == "POST" and path in {"/radio/loopback/start", "/loopback/start"}:
+        return start_loopback(payload)
+    if method == "POST" and path in {"/radio/tx/start", "/tx/start"}:
+        return start_tx(payload)
+    if method == "POST" and path in {"/radio/tx/stop", "/tx/stop"}:
+        return stop_tx()
+    if method == "POST" and path in {"/radio/tx/guardrails", "/tx/guardrails"}:
+        return tx_guardrails(payload)
+    if method == "POST" and path in {"/radio/calibration/apply", "/calibration/apply"}:
+        return apply_calibration(payload)
+    if method == "POST" and path in {"/system/self-test", "/self-test"}:
+        return self_test(payload)
+    if method == "POST" and path in {"/radio/doppler/plan", "/doppler/plan"}:
+        return doppler_plan(payload)
+    if method == "POST" and path in {"/radio/doppler/start", "/doppler/start"}:
+        return doppler_start(payload)
+    if method == "POST" and path in {"/radio/doppler/stop", "/doppler/stop"}:
+        return doppler_stop()
+    if method == "POST" and path in {"/radio/doppler/tick", "/doppler/tick"}:
+        return doppler_tick(payload)
+    raise ApiError("not_found", "unknown radio API path", status=404, details={"path": path, "method": method})
+
+
+def run_cgi():
+    method = os.environ.get("REQUEST_METHOD", "GET").upper()
+    payload = read_request_body() if method in {"POST", "PUT", "PATCH"} else query_params()
+    path = cgi_path()
+    if method == "GET" and path in {"/radio/audio/live.pcm", "/audio/live.pcm"}:
+        stream_audio("pcm", payload)
+        return
+    if method == "GET" and path in {"/radio/audio/live.wav", "/audio/live.wav"}:
+        stream_audio("wav", payload)
+        return
+    if method == "GET" and path in {"/capture/download"}:
+        download_capture(payload)
+        return
+    json_response(route(method, path, payload))
+
+
+def run_cli(argv):
+    if len(argv) < 2:
+        raise ApiError("usage", "usage: pluto-radio-api status|health|logs|profiles|apply|tune|stop|audio-start|audio-stop|audio-status|watchdog-status|watchdog-check|capture-start|capture-list|capture-delete|spectrum-status|spectrum-snapshot|spectrum-top|loopback-status|loopback-start|tx-status|tx-guardrails|tx-start|tx-stop|calibration-status|calibration-apply|self-test|self-test-status|doppler-status|doppler-plan|doppler-start|doppler-stop|doppler-tick", status=2)
+    command = argv[1]
+    if command == "status":
+        return radio_status()
+    if command == "health":
+        return system_health()
+    if command == "logs":
+        params = {}
+        if len(argv) > 2:
+            params["source"] = argv[2]
+        if len(argv) > 3:
+            params["lines"] = argv[3]
+        return system_logs(params)
+    if command in {"profiles", "list-profiles"}:
+        return list_profiles()
+    if command == "apply":
+        if len(argv) < 3:
+            raise ApiError("usage", "usage: pluto-radio-api apply PROFILE [FREQUENCY_HZ]", status=2)
+        payload = {"profile": argv[2]}
+        if len(argv) > 3:
+            payload["frequency_hz"] = argv[3]
+        return apply_profile(payload)
+    if command == "tune":
+        if len(argv) < 3:
+            raise ApiError("usage", "usage: pluto-radio-api tune FREQUENCY_HZ", status=2)
+        return tune({"frequency_hz": argv[2]})
+    if command == "stop":
+        return stop_radio()
+    if command == "audio-status":
+        return audio_status()
+    if command == "audio-start":
+        payload = {}
+        for arg in argv[2:]:
+            if arg == "--simulate":
+                payload["simulate"] = "true"
+            elif "=" in arg:
+                key, value = arg.split("=", 1)
+                payload[key] = value
+            elif "profile" not in payload:
+                payload["profile"] = arg
+        return start_audio(payload)
+    if command == "audio-stop":
+        return stop_audio()
+    if command == "watchdog-status":
+        return watchdog_status()
+    if command == "watchdog-check":
+        return watchdog_check()
+    if command == "capture-list":
+        return capture_list()
+    if command == "capture-start":
+        payload = {}
+        if len(argv) > 2:
+            payload["profile"] = argv[2]
+        if "--simulate" in argv:
+            payload["simulate"] = "true"
+        return start_capture(payload)
+    if command == "capture-delete":
+        if len(argv) < 3:
+            raise ApiError("usage", "usage: pluto-radio-api capture-delete CAPTURE_ID", status=2)
+        return delete_capture({"capture_id": argv[2]})
+    if command == "spectrum-status":
+        return spectrum_status()
+    if command == "spectrum-snapshot":
+        payload = {"simulate": "true"} if "--simulate" in argv else {}
+        if len(argv) > 2 and not argv[2].startswith("--"):
+            payload["profile"] = argv[2]
+        return spectrum_snapshot(payload)
+    if command == "spectrum-top":
+        payload = {"simulate": "true"} if "--simulate" in argv else {}
+        if len(argv) > 2 and not argv[2].startswith("--"):
+            payload["profile"] = argv[2]
+        return spectrum_top(payload)
+    if command == "loopback-status":
+        return loopback_status()
+    if command == "loopback-start":
+        payload = {"profile": "LOOPBACK_TEST"}
+        profile_set = False
+        for arg in argv[2:]:
+            if arg == "--simulate":
+                payload["simulate"] = "true"
+            elif arg == "--confirm-live-tx":
+                payload["confirm_live_tx"] = "true"
+            elif "=" in arg:
+                key, value = arg.split("=", 1)
+                payload[key] = value
+            elif not profile_set:
+                payload["profile"] = arg
+                profile_set = True
+        return start_loopback(payload)
+    if command == "tx-status":
+        return tx_status()
+    if command == "tx-guardrails":
+        payload = {}
+        profile_set = False
+        for arg in argv[2:]:
+            if arg == "--simulate":
+                payload["simulate"] = "true"
+            elif arg == "--confirm-live-tx":
+                payload["confirm_live_tx"] = "true"
+            elif "=" in arg:
+                key, value = arg.split("=", 1)
+                payload[key] = value
+            elif not profile_set:
+                payload["profile"] = arg
+                profile_set = True
+        return tx_guardrails(payload)
+    if command == "tx-start":
+        payload = {"profile": "TX_TEST_TONE"}
+        profile_set = False
+        for arg in argv[2:]:
+            if arg == "--simulate":
+                payload["simulate"] = "true"
+            elif arg == "--confirm-live-tx":
+                payload["confirm_live_tx"] = "true"
+            elif "=" in arg:
+                key, value = arg.split("=", 1)
+                payload[key] = value
+            elif not profile_set:
+                payload["profile"] = arg
+                profile_set = True
+        return start_tx(payload)
+    if command == "tx-stop":
+        return stop_tx()
+    if command == "calibration-status":
+        return calibration_status()
+    if command == "calibration-apply":
+        payload = {}
+        for arg in argv[2:]:
+            if "=" not in arg:
+                raise ApiError("usage", "usage: pluto-radio-api calibration-apply key=value ...", status=2)
+            key, value = arg.split("=", 1)
+            payload[key] = value
+        return apply_calibration(payload)
+    if command == "self-test":
+        payload = {}
+        for arg in argv[2:]:
+            if "=" in arg:
+                key, value = arg.split("=", 1)
+                payload[key] = value
+        return self_test(payload)
+    if command == "self-test-status":
+        return self_test_status()
+    if command == "doppler-status":
+        return doppler_status()
+    if command == "doppler-plan":
+        profile = argv[2] if len(argv) > 2 else "SAT_AUDIO_NFM"
+        start_ms = int(time.time() * 1000)
+        start_utc = datetime.fromtimestamp(start_ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        stop_utc = datetime.fromtimestamp((start_ms + 3000) / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        sample_plan = {
+            "profile": profile,
+            "base_frequency_hz": get_profile(profile)["default_frequency_hz"],
+            "start_utc": start_utc,
+            "stop_utc": stop_utc,
+            "retune_interval_ms": 1000,
+            "doppler_table": [
+                {"offset_ms": 0, "frequency_hz": get_profile(profile)["default_frequency_hz"]},
+                {"offset_ms": 1000, "frequency_hz": get_profile(profile)["default_frequency_hz"] + 100},
+            ],
+        }
+        return doppler_plan(sample_plan)
+    if command == "doppler-start":
+        profile = argv[2] if len(argv) > 2 else "SAT_AUDIO_NFM"
+        start_ms = int(time.time() * 1000)
+        sample_plan = {
+            "profile": profile,
+            "base_frequency_hz": get_profile(profile)["default_frequency_hz"],
+            "start_utc": datetime.fromtimestamp(start_ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "stop_utc": datetime.fromtimestamp((start_ms + 3000) / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "retune_interval_ms": 1000,
+            "doppler_table": [
+                {"offset_ms": 0, "frequency_hz": get_profile(profile)["default_frequency_hz"]},
+                {"offset_ms": 1000, "frequency_hz": get_profile(profile)["default_frequency_hz"] + 100},
+            ],
+        }
+        return doppler_start(sample_plan)
+    if command == "doppler-stop":
+        return doppler_stop()
+    if command == "doppler-tick":
+        payload = {}
+        if len(argv) > 2:
+            payload["now_ms"] = argv[2]
+        if dry_run():
+            payload.update(
+                {
+                    "profile": "SAT_AUDIO_NFM",
+                    "base_frequency_hz": get_profile("SAT_AUDIO_NFM")["default_frequency_hz"],
+                    "start_utc": now_utc(),
+                    "stop_utc": datetime.fromtimestamp(time.time() + 3, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "doppler_table": [{"offset_ms": 0, "frequency_hz": get_profile("SAT_AUDIO_NFM")["default_frequency_hz"]}],
+                }
+            )
+        return doppler_tick(payload)
+    raise ApiError("usage", f"unknown command {command}", status=2)
+
+
+def main():
+    try:
+        if is_cgi():
+            run_cgi()
+        else:
+            json_response(run_cli(sys.argv))
+    except ApiError as exc:
+        if exc.code.startswith("audio_"):
+            fail_audio_state(exc.code, exc.message)
+        fail_state(exc.code, exc.message)
+        json_response({"ok": False, "error": exc.code, "message": exc.message, "details": exc.details}, exc.status)
+        if not is_cgi():
+            sys.exit(1 if exc.status >= 400 else exc.status)
+    except Exception as exc:
+        fail_state("internal_error", str(exc))
+        json_response({"ok": False, "error": "internal_error", "message": str(exc)}, 500)
+        if not is_cgi():
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

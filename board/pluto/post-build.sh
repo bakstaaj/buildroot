@@ -49,6 +49,7 @@ rm -Rf ${TARGET_DIR}/etc/dropbear
 
 mkdir -p ${TARGET_DIR}/www/img
 mkdir -p ${TARGET_DIR}/www/cgi-bin
+mkdir -p ${TARGET_DIR}/etc/pluto-radio/profiles
 mkdir -p ${TARGET_DIR}/etc/wpa_supplicant/
 mkdir -p ${TARGET_DIR}/mnt/jffs2
 mkdir -p ${TARGET_DIR}/mnt/msd
@@ -67,6 +68,7 @@ ${INSTALL} -D -m 0755 ${BOARD_DIR}/S40network ${TARGET_DIR}/etc/init.d/
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/S41network ${TARGET_DIR}/etc/init.d/
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/S45msd ${TARGET_DIR}/etc/init.d/
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/S50dropbear ${TARGET_DIR}/etc/init.d/
+${INSTALL} -D -m 0755 ${BOARD_DIR}/S70pluto-radio-api ${TARGET_DIR}/etc/init.d/
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/S98autostart ${TARGET_DIR}/etc/init.d/
 ${INSTALL} -D -m 0644 ${BOARD_DIR}/fw_env.config ${TARGET_DIR}/etc/
 ${INSTALL} -D -m 0644 ${BOARD_DIR}/VERSIONS ${TARGET_DIR}/opt/
@@ -77,6 +79,13 @@ ${INSTALL} -D -m 0755 ${BOARD_DIR}/device_format_jffs2 ${TARGET_DIR}/usr/sbin/
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/pluto-eth-fallback ${TARGET_DIR}/usr/sbin/
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/pluto-sdcard-prepare ${TARGET_DIR}/usr/sbin/
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/pluto-web-apply-settings ${TARGET_DIR}/usr/sbin/
+${INSTALL} -D -m 0755 ${BOARD_DIR}/pluto-radio-api ${TARGET_DIR}/usr/sbin/
+${INSTALL} -D -m 0755 ${BOARD_DIR}/pluto-audio-backend ${TARGET_DIR}/usr/sbin/pluto-audio-ref-backend
+if [ "$BR2_PACKAGE_PLUTO_AUDIO_DSP" != "y" ] ; then
+	${INSTALL} -D -m 0755 ${BOARD_DIR}/pluto-audio-backend ${TARGET_DIR}/usr/sbin/pluto-audio-backend
+fi
+${INSTALL} -D -m 0755 ${BOARD_DIR}/pluto-audio-sim-backend ${TARGET_DIR}/usr/sbin/
+${INSTALL} -D -m 0755 ${BOARD_DIR}/pluto-doppler-worker ${TARGET_DIR}/usr/sbin/
 ${INSTALL} -D -m 0644 ${BOARD_DIR}/motd ${TARGET_DIR}/etc/
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/test_ensm_pinctrl.sh ${TARGET_DIR}/usr/sbin/
 ${INSTALL} -D -m 0644 ${BOARD_DIR}/device_config ${TARGET_DIR}/etc/
@@ -90,6 +99,8 @@ ${INSTALL} -D -m 0644 ${BOARD_DIR}/msd/*.html ${TARGET_DIR}/www/
 ${INSTALL} -D -m 0644 ${BOARD_DIR}/web/*.html ${TARGET_DIR}/www/
 ${INSTALL} -D -m 0644 ${BOARD_DIR}/web/img/* ${TARGET_DIR}/www/img/
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/web/cgi-bin/* ${TARGET_DIR}/www/cgi-bin/
+${INSTALL} -D -m 0755 ${BOARD_DIR}/pluto-radio-api ${TARGET_DIR}/www/cgi-bin/pluto-radio-api
+${INSTALL} -D -m 0644 ${BOARD_DIR}/pluto-radio/profiles/*.json ${TARGET_DIR}/etc/pluto-radio/profiles/
 
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/wpa_supplicant/* ${TARGET_DIR}/etc/wpa_supplicant/
 
