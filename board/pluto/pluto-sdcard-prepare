@@ -4,6 +4,9 @@ destdir=/media
 blkid_bin="${BLKID:-/sbin/blkid}"
 fsck_vfat_bin="${FSCK_VFAT:-/sbin/fsck.vfat}"
 e2fsck_bin="${E2FSCK:-/sbin/e2fsck}"
+mke2fs_bin="${MKE2FS:-/usr/sbin/mke2fs}"
+resize2fs_bin="${RESIZE2FS:-/usr/sbin/resize2fs}"
+partprobe_bin="${PARTPROBE:-/sbin/partprobe}"
 
 log() {
 	logger -t pluto-sdcard-prepare "$*"
@@ -18,6 +21,32 @@ is_sd_part() {
 			return 1
 			;;
 	esac
+}
+
+is_sd_boot_part() {
+	case "$1" in
+		mmcblk[0-9]p1)
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+is_sd_data_part() {
+	case "$1" in
+		mmcblk[0-9]p2)
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+sd_parent_disk() {
+	echo "$1" | sed 's/p[0-9][0-9]*$//'
 }
 
 is_mounted() {
@@ -36,7 +65,11 @@ mount_opts() {
 }
 
 mount_point() {
-	echo "${destdir}/$1"
+	if is_sd_data_part "$1"; then
+		echo "${destdir}"
+	else
+		echo "${destdir}/$1"
+	fi
 }
 
 mount_is_rw() {
@@ -167,6 +200,91 @@ repair_fs() {
 	fi
 }
 
+probe_partitions() {
+	local disk="$1"
+
+	if [ -x "$partprobe_bin" ]; then
+		"$partprobe_bin" "/dev/$disk" 2>/dev/null || true
+	elif command -v partprobe >/dev/null 2>&1; then
+		partprobe "/dev/$disk" 2>/dev/null || true
+	fi
+}
+
+expand_data_partition() {
+	local dev="$1"
+	local disk
+	local disk_sectors
+
+	is_sd_data_part "$dev" || return 0
+	is_mounted "$dev" && return 0
+	disk="$(sd_parent_disk "$dev")"
+	[ -b "/dev/$disk" ] || return 0
+	[ -r "/sys/block/$disk/size" ] || return 0
+	disk_sectors="$(cat "/sys/block/$disk/size" 2>/dev/null)"
+	case "$disk_sectors" in
+		""|*[!0-9]*)
+			return 0
+			;;
+	esac
+
+	python3 - "$disk" "$disk_sectors" <<'PY'
+import struct
+import sys
+
+disk = sys.argv[1]
+disk_sectors = int(sys.argv[2])
+mbr_path = f"/dev/{disk}"
+entry_offset = 446 + 16
+
+with open(mbr_path, "r+b", buffering=0) as handle:
+    handle.seek(0)
+    mbr = bytearray(handle.read(512))
+    if len(mbr) != 512 or mbr[510:512] != b"\x55\xaa":
+        raise SystemExit(0)
+    entry = mbr[entry_offset : entry_offset + 16]
+    part_type = entry[4]
+    if part_type not in (0x00, 0x83):
+        raise SystemExit(0)
+    start, size = struct.unpack_from("<II", entry, 8)
+    if start <= 0 or start >= disk_sectors:
+        raise SystemExit(0)
+    desired = disk_sectors - start
+    if desired <= size + 2048:
+        raise SystemExit(0)
+    struct.pack_into("<I", mbr, entry_offset + 12, desired)
+    handle.seek(0)
+    handle.write(mbr)
+    handle.flush()
+PY
+	probe_partitions "$disk"
+	sleep 1
+}
+
+format_data_partition() {
+	local dev="$1"
+
+	is_sd_data_part "$dev" || return 0
+	if [ -x "$mke2fs_bin" ]; then
+		"$mke2fs_bin" -t ext4 -L PLUTO_DATA -m 0 -O ^64bit -F "/dev/$dev"
+	elif command -v mke2fs >/dev/null 2>&1; then
+		mke2fs -t ext4 -L PLUTO_DATA -m 0 -O ^64bit -F "/dev/$dev"
+	else
+		log "mke2fs not available; cannot format /dev/$dev as ext4"
+		return 1
+	fi
+}
+
+resize_data_fs() {
+	local dev="$1"
+
+	is_sd_data_part "$dev" || return 0
+	if [ -x "$resize2fs_bin" ]; then
+		"$resize2fs_bin" "/dev/$dev" >/dev/null 2>&1 || true
+	elif command -v resize2fs >/dev/null 2>&1; then
+		resize2fs "/dev/$dev" >/dev/null 2>&1 || true
+	fi
+}
+
 unmount_dev() {
 	local dev="$1"
 
@@ -210,13 +328,25 @@ prepare_dev() {
 	local fstype
 
 	[ -b "/dev/$dev" ] || return 0
+	if is_sd_boot_part "$dev"; then
+		log "skipping SD boot partition /dev/$dev"
+		return 0
+	fi
 	log "preparing /dev/$dev"
 
 	if is_sd_part "$dev"; then
+		expand_data_partition "$dev"
 		fstype="$(blkid_fs_type "$dev")"
+		if is_sd_data_part "$dev" && [ -z "$fstype" ]; then
+			format_data_partition "$dev" || return 1
+			fstype="$(blkid_fs_type "$dev")"
+		fi
 		if is_supported_type "$fstype"; then
 			unmount_dev "$dev" || return 1
 			repair_fs "$dev" "$fstype" || return 1
+			if is_sd_data_part "$dev" && is_ext_type "$fstype"; then
+				resize_data_fs "$dev"
+			fi
 		fi
 	fi
 

@@ -2,14 +2,40 @@
 
 destdir=/media
 
+is_ignored_dev()
+{
+	case "$1" in
+		mmcblk[0-9]p1)
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
 my_umount()
 {
 	if grep -qs "^/dev/$1 " /proc/mounts ; then
-		umount "${destdir}/$1";
+		umount "$(mount_point "$1")";
 		echo heartbeat > /sys/class/leds/led0:green/trigger
 	fi
 
-	[ -d "${destdir}/$1" ] && rmdir "${destdir}/$1"
+	if [ "$(mount_point "$1")" != "$destdir" ]; then
+		[ -d "$(mount_point "$1")" ] && rmdir "$(mount_point "$1")"
+	fi
+}
+
+mount_point()
+{
+	case "$1" in
+		mmcblk[0-9]p2)
+			echo "$destdir"
+			;;
+		*)
+			echo "${destdir}/$1"
+			;;
+	esac
 }
 
 do_mount()
@@ -50,17 +76,19 @@ do_mount()
 
 my_mount()
 {
-	mkdir -p "${destdir}/$1" || exit 1
+	mkdir -p "$(mount_point "$1")" || exit 1
 
 	if ! do_mount $1; then
 		# failed to mount, clean up mountpoint
-		rmdir "${destdir}/$1"
+		if [ "$(mount_point "$1")" != "$destdir" ]; then
+			rmdir "$(mount_point "$1")"
+		fi
 		exit 1
 	fi
 
 	echo default-on > /sys/class/leds/led0:green/trigger
 
-	for i in ${destdir}/$1/runme??* ;do
+	for i in "$(mount_point "$1")"/runme??* ;do
 
 	# Ignore dangling symlinks (if any).
 	[ ! -f "$i" ] && continue
@@ -84,10 +112,12 @@ my_mount()
 
 case "${ACTION}" in
 add|"")
+	is_ignored_dev "${MDEV}" && exit 0
 	my_umount ${MDEV}
 	my_mount ${MDEV}
 	;;
 remove)
+	is_ignored_dev "${MDEV}" && exit 0
 	my_umount ${MDEV}
 	;;
 remove_all)
