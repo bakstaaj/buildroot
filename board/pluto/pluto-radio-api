@@ -2414,6 +2414,10 @@ def route(method, path, payload):
         return capture_metadata(payload)
     if method == "GET" and path in {"/radio/spectrum/status", "/spectrum/status"}:
         return spectrum_status()
+    if method == "GET" and path in {"/radio/spectrum/snapshot", "/spectrum/snapshot"}:
+        return spectrum_snapshot(payload)
+    if method == "GET" and path in {"/radio/spectrum/top", "/spectrum/top"}:
+        return spectrum_top(payload)
     if method == "GET" and path in {"/radio/doppler/status", "/doppler/status"}:
         return doppler_status()
     if method == "GET" and path in {"/radio/loopback/status", "/loopback/status"}:
