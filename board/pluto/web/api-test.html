@@ -20,8 +20,8 @@
 	</nav>
 </header>
 
-<main>
-	<section class="band">
+<main class="api-page">
+	<section class="band api-status">
 		<div class="section-head">
 			<h2>Quick Status</h2>
 			<span id="lastRun">Not run</span>
@@ -29,118 +29,70 @@
 		<div class="metric-grid" id="quickMetrics"></div>
 	</section>
 
-	<section class="band api-docs">
-		<div class="section-head">
-			<h2>API Contract</h2>
-			<span>CGI entrypoint: /cgi-bin/pluto-radio-api</span>
-		</div>
-		<p>Use the <code>path</code> query parameter for logical routes. POST requests use JSON bodies and all responses are JSON.</p>
-		<p>TX modes are <code>tone</code>, <code>carrier</code>, <code>am</code>, <code>fm</code>, and <code>cw</code>. AM/FM can use a built-in test tone or app-provided signed 16-bit mono PCM from a safe file/FIFO path.</p>
-		<div class="api-grid">
-			<div>
-				<h3>Status and Control</h3>
-				<pre>GET  /system/health
-GET  /radio/status
-GET  /radio/profile/list
-POST /radio/profile/apply
-POST /radio/tune
-POST /radio/stop</pre>
+	<div class="api-workspace">
+		<aside class="band endpoint-pane">
+			<div class="section-head">
+				<h2>Workflow</h2>
+				<span>/cgi-bin/pluto-radio-api</span>
 			</div>
-			<div>
-				<h3>Audio and Spectrum</h3>
-				<pre>POST /radio/audio/start
-POST /radio/audio/stop
-GET  /radio/audio/status
-GET  /radio/audio/live.wav
-POST /radio/spectrum/snapshot
-POST /radio/spectrum/top</pre>
-			</div>
-			<div>
-				<h3>Diagnostics and TX</h3>
-				<pre>POST /radio/loopback/start
-GET  /radio/loopback/status
-GET  /radio/tx/guardrails
-POST /radio/tx/guardrails
-POST /radio/tx/start
-POST /radio/tx/stop
-GET  /radio/tx/status</pre>
-			</div>
-			<div>
-				<h3>Calibration and Self Test</h3>
-				<pre>GET  /radio/calibration/status
-POST /radio/calibration/apply
-POST /system/self-test
-GET  /system/self-test/status</pre>
-			</div>
-			<div>
-				<h3>Doppler</h3>
-				<pre>POST /radio/doppler/plan
-POST /radio/doppler/start
-POST /radio/doppler/tick
-POST /radio/doppler/stop
-GET  /radio/doppler/status</pre>
-			</div>
-		</div>
-	</section>
+			<div id="endpointCatalog" class="endpoint-catalog"></div>
+		</aside>
 
-	<section class="band">
-		<div class="section-head">
-			<h2>Safe Tests</h2>
-			<span>Simulation unless noted</span>
-		</div>
-		<div class="api-actions" id="safeTests"></div>
-	</section>
-
-	<section class="band controls">
-		<div class="section-head">
-			<h2>Custom Request</h2>
-			<span>Advanced app-builder console</span>
-		</div>
-		<form id="customForm" class="api-form">
-			<div>
-				<label for="method">Method</label>
-				<select id="method" name="method">
-					<option>GET</option>
-					<option>POST</option>
-				</select>
+		<section class="band request-pane">
+			<div class="section-head">
+				<div>
+					<h2 id="selectedTitle">Health</h2>
+					<p id="selectedDescription">Firmware, radio, audio, TX, storage, and watchdog state.</p>
+				</div>
+				<span>path query routing</span>
 			</div>
-			<div>
-				<label for="path">Path</label>
-				<input id="path" name="path" value="/system/health">
+			<form id="customForm" class="api-form">
+				<div>
+					<label for="method">Method</label>
+					<select id="method" name="method">
+						<option>GET</option>
+						<option>POST</option>
+					</select>
+				</div>
+				<div>
+					<label for="path">Path</label>
+					<input id="path" name="path" value="/system/health">
+				</div>
+				<div class="api-wide">
+					<label for="payload">JSON Body</label>
+					<textarea id="payload" name="payload" rows="11">{}</textarea>
+					<div class="hint">GET ignores the body. POST sends application/json.</div>
+				</div>
+			</form>
+			<div id="liveTxPanel" class="tx-danger inline-guard">
+				<label class="checkline">
+					<input type="checkbox" id="liveTxConfirm">
+					I understand this emits live RF and I am using a dummy load, shielding, or a legal test frequency.
+				</label>
 			</div>
-			<div class="api-wide">
-				<label for="payload">JSON Payload</label>
-				<textarea id="payload" name="payload" rows="8">{}</textarea>
-				<div class="hint">POST bodies are sent as application/json.</div>
+			<div class="actions">
+				<button type="button" id="resetPayload">Reset Body</button>
+				<button type="button" id="stopTx">Stop TX</button>
+				<button type="button" id="runSelected">Send Request</button>
 			</div>
-		</form>
-		<div class="actions">
-			<button type="button" id="runCustom">Run Request</button>
-		</div>
-	</section>
+			<div class="request-preview">
+				<div class="label">Request Preview</div>
+				<pre id="requestPreview"></pre>
+			</div>
+		</section>
 
-	<section class="band tx-danger">
-		<div class="section-head">
-			<h2>Live TX Guard</h2>
-			<span>Use only with a controlled RF setup</span>
-		</div>
-		<label class="checkline">
-			<input type="checkbox" id="liveTxConfirm">
-			I understand this emits live RF and I am using a dummy load, shielding, or a legal test frequency.
-		</label>
-		<div class="api-actions">
-			<button type="button" id="runLiveTx">Run 2s Live TX Test</button>
-			<button type="button" id="stopTx">Stop TX</button>
-		</div>
-	</section>
-
-	<section class="band">
-		<div class="section-head">
-			<h2>Response</h2>
-			<span id="responseState">Waiting</span>
-		</div>
-		<pre id="apiResponse" class="api-response">{}</pre>
-	</section>
+		<section class="band response-pane">
+			<div class="section-head">
+				<h2>Response</h2>
+				<span id="responseState">Waiting</span>
+			</div>
+			<div class="response-meta">
+				<div><span>Status</span><strong id="statusCode">n/a</strong></div>
+				<div><span>Elapsed</span><strong id="elapsedMs">n/a</strong></div>
+			</div>
+			<pre id="apiResponse" class="api-response">{}</pre>
+		</section>
+	</div>
 </main>
 
 <script src="img/pluto-api-test.js"></script>
