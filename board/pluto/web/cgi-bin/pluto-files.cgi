@@ -4,8 +4,31 @@ echo "Content-Type: application/json"
 echo "Cache-Control: no-store"
 echo
 
+json_escape_stream() {
+	awk '
+		BEGIN { ORS = "" }
+		{
+			if (NR > 1) printf "\\n"
+			gsub(/\\/, "\\\\")
+			gsub(/"/, "\\\"")
+			gsub(/\t/, "\\t")
+			gsub(/\r/, "\\r")
+			gsub(/[\001-\010\013\014\016-\037]/, "")
+			printf "%s", $0
+		}
+	'
+}
+
+json_escape_file_stream() {
+	if command -v python3 >/dev/null 2>&1; then
+		python3 -c 'import json, sys; sys.stdout.write(json.dumps(sys.stdin.buffer.read().decode("utf-8", "replace"))[1:-1])'
+	else
+		json_escape_stream
+	fi
+}
+
 json_escape() {
-	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/ /g'
+	printf '%s' "$1" | json_escape_stream
 }
 
 json_pair() {
@@ -141,7 +164,7 @@ read_file() {
 	json_pair size "$(file_size "$target")"; printf ','
 	printf '"truncated":"%s",' "$([ "$(file_size "$target")" -gt 32768 ] && echo 1 || echo 0)"
 	printf '"content":"'
-	dd if="$target" bs=1024 count=32 2>/dev/null | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/ /g; s/$/\\n/' | tr -d '\n'
+	dd if="$target" bs=1024 count=32 2>/dev/null | json_escape_file_stream
 	printf '"}\n'
 }
 

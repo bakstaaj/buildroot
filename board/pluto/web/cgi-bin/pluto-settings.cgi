@@ -8,8 +8,23 @@ echo "Content-Type: application/json"
 echo "Cache-Control: no-store"
 echo
 
+json_escape_stream() {
+	awk '
+		BEGIN { ORS = "" }
+		{
+			if (NR > 1) printf "\\n"
+			gsub(/\\/, "\\\\")
+			gsub(/"/, "\\\"")
+			gsub(/\t/, "\\t")
+			gsub(/\r/, "\\r")
+			gsub(/[\001-\010\013\014\016-\037]/, "")
+			printf "%s", $0
+		}
+	'
+}
+
 json_escape() {
-	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/ /g'
+	printf '%s' "$1" | json_escape_stream
 }
 
 json_pair() {
