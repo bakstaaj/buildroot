@@ -5,18 +5,16 @@ source /etc/device_config
 
 case "$1" in
 	start)
-		echo -n "Starting dhcpd Daemon & httpd Server: "
+		echo -n "Starting dhcpd Daemon: "
 		start-stop-daemon -S -q -p /var/run/udhcpd.pid -x /usr/sbin/udhcpd -- $UDHCPD_CONF
 		if [ -f /etc/udhcpd-eth0.conf ]; then
 			start-stop-daemon -S -q -p /var/run/udhcpd-eth0.pid -x /usr/sbin/udhcpd -- /etc/udhcpd-eth0.conf
 		fi
-		httpd -h /www
 		[ $? = 0 ] && echo "OK" || echo "FAIL"
 		;;
 
 	stop)
-		echo -n "Stopping dhcpd Daemon & httpd Server: "
-		killall -7 httpd
+		echo -n "Stopping dhcpd Daemon: "
 		start-stop-daemon -K -q -p /var/run/udhcpd.pid 2>/dev/null
 		start-stop-daemon -K -q -p /var/run/udhcpd-eth0.pid 2>/dev/null
 		start-stop-daemon -K -q -p /var/run/udhcpc-eth0.pid 2>/dev/null

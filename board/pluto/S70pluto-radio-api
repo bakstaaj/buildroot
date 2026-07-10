@@ -2,14 +2,21 @@
 
 API=/usr/sbin/pluto-radio-api
 STATE_DIR=/var/run/pluto-radio
+PID_FILE=$STATE_DIR/api-http.pid
+LOG_FILE=$STATE_DIR/api-http.log
+HOST=127.0.0.1
+PORT=8081
 
 case "$1" in
 	start)
-		printf "Preparing Pluto radio API: "
+		printf "Starting Pluto radio API: "
 		mkdir -p "$STATE_DIR"
 		if [ -x "$API" ]; then
 			if "$API" profiles > "$STATE_DIR/profile-check.json" 2> "$STATE_DIR/profile-check.err"; then
-				echo "OK"
+				PLUTO_RADIO_API_MODE=lighttpd-python-http \
+					start-stop-daemon -S -q -b -m -p "$PID_FILE" -x "$API" \
+					-- serve host="$HOST" port="$PORT" >> "$LOG_FILE" 2>&1
+				[ $? = 0 ] && echo "OK" || echo "FAIL"
 			else
 				echo "FAIL"
 			fi
@@ -19,11 +26,18 @@ case "$1" in
 		;;
 	stop)
 		printf "Stopping Pluto radio API: "
+		start-stop-daemon -K -q -p "$PID_FILE" 2>/dev/null
+		rm -f "$PID_FILE"
 		[ -x "$API" ] && "$API" stop >/dev/null 2>&1
 		echo "OK"
 		;;
 	status)
-		[ -x "$API" ] && "$API" watchdog-status
+		if [ -f "$PID_FILE" ]; then
+			printf '{"api_http":{"state":"running","pid":"%s","host":"%s","port":"%s"},' "$(cat "$PID_FILE" 2>/dev/null)" "$HOST" "$PORT"
+			[ -x "$API" ] && "$API" watchdog-status | sed 's/^{//'
+		else
+			printf '{"api_http":{"state":"stopped","host":"%s","port":"%s"}}\n' "$HOST" "$PORT"
+		fi
 		;;
 	check)
 		[ -x "$API" ] && "$API" watchdog-check

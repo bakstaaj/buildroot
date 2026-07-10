@@ -9,10 +9,12 @@ import socket
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 
 DEFAULT_PROFILE_DIRS = (
@@ -38,6 +40,16 @@ TX_BACKEND = Path("/usr/sbin/pluto-tx-backend")
 DEFAULT_AUDIO_BACKEND = Path("/usr/sbin/pluto-audio-backend")
 SIM_AUDIO_BACKEND = Path("/usr/sbin/pluto-audio-sim-backend")
 DOPPLER_WORKER = Path("/usr/sbin/pluto-doppler-worker")
+WEB_SETTINGS_DIR = Path("/mnt/jffs2/pluto-web")
+WEB_SETTINGS_FILE = WEB_SETTINGS_DIR / "settings.conf"
+WEB_SETTINGS_APPLY = Path("/usr/sbin/pluto-web-apply-settings")
+WEB_FILE_ROOTS = {
+    "jffs2": Path("/mnt/jffs2"),
+    "media": Path("/media"),
+    "opt": Path("/opt"),
+    "logs": Path("/var/log"),
+    "web": Path("/www"),
+}
 RADIO_NAME = "ad9361-phy"
 PROFILE_RE = re.compile(r"^[A-Z0-9_.-]+$")
 CAPTURE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -48,6 +60,18 @@ DEEMPHASIS_MODES = {"none", "50us", "75us"}
 TX_MODES = {"tone", "carrier", "am", "fm", "cw"}
 TX_AUDIO_SOURCES = {"tone", "file"}
 TX_AUDIO_SAFE_ROOTS = ("/mnt/jffs2/", "/media/", "/tmp/", "/var/run/")
+WEB_SETTINGS_SCHEMA = (
+    {"key": "rx_lo_hz", "label": "RX LO", "unit": "Hz", "min": "70000000", "max": "6000000000"},
+    {"key": "tx_lo_hz", "label": "TX LO", "unit": "Hz", "min": "70000000", "max": "6000000000"},
+    {"key": "rx_sample_rate_hz", "label": "RX sample rate", "unit": "SPS", "min": "520000", "max": "61440000"},
+    {"key": "tx_sample_rate_hz", "label": "TX sample rate", "unit": "SPS", "min": "520000", "max": "61440000"},
+    {"key": "rx_rf_bandwidth_hz", "label": "RX RF bandwidth", "unit": "Hz", "min": "200000", "max": "56000000"},
+    {"key": "tx_rf_bandwidth_hz", "label": "TX RF bandwidth", "unit": "Hz", "min": "200000", "max": "56000000"},
+    {"key": "rx_gain_control_mode", "label": "RX gain mode", "unit": "manual|slow_attack|fast_attack|hybrid"},
+    {"key": "rx_hardwaregain_db", "label": "RX hardware gain", "unit": "dB"},
+    {"key": "tx_hardwaregain_db", "label": "TX hardware gain", "unit": "dB"},
+    {"key": "ensm_mode", "label": "ENSM mode", "unit": "sleep|alert|fdd|pinctrl|rx|tx"},
+)
 LOOPBACK_MAX_SECONDS = int(os.environ.get("PLUTO_LOOPBACK_MAX_SECONDS", "10"))
 LOOPBACK_MAX_TX_AMPLITUDE = float(os.environ.get("PLUTO_LOOPBACK_MAX_TX_AMPLITUDE", "0.25"))
 TX_MAX_SECONDS = int(os.environ.get("PLUTO_TX_MAX_SECONDS", "30"))
@@ -58,6 +82,7 @@ CAPTURE_MAX_SECONDS = int(os.environ.get("PLUTO_CAPTURE_MAX_SECONDS", "60"))
 CAPTURE_MAX_BYTES = int(os.environ.get("PLUTO_CAPTURE_MAX_BYTES", str(16 * 1024 * 1024)))
 SPECTRUM_MAX_BINS = int(os.environ.get("PLUTO_SPECTRUM_MAX_BINS", "1024"))
 SPECTRUM_MAX_TOP_N = int(os.environ.get("PLUTO_SPECTRUM_MAX_TOP_N", "20"))
+SPECTRUM_MAX_STREAM_FRAMES = int(os.environ.get("PLUTO_SPECTRUM_MAX_STREAM_FRAMES", "3600"))
 DOPPLER_MAX_POINTS = int(os.environ.get("PLUTO_DOPPLER_MAX_POINTS", "7200"))
 DOPPLER_MIN_INTERVAL_MS = int(os.environ.get("PLUTO_DOPPLER_MIN_INTERVAL_MS", "250"))
 LOG_FILES = {
@@ -288,24 +313,38 @@ def json_response(payload, status=200):
     print(json.dumps(payload, sort_keys=True))
 
 
+def flatten_params(parsed):
+    return {key: values[-1] for key, values in parsed.items()}
+
+
+def parse_request_body(raw, content_type):
+    if not raw:
+        return {}
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    if "application/json" in content_type:
+        try:
+            payload = json.loads(raw or "{}")
+        except json.JSONDecodeError as exc:
+            raise ApiError("invalid_json", str(exc))
+        if not isinstance(payload, dict):
+            raise ApiError("invalid_json", "JSON request body must be an object")
+        return payload
+    parsed = parse_qs(raw, keep_blank_values=True)
+    return flatten_params(parsed)
+
+
 def read_request_body():
     length = int(os.environ.get("CONTENT_LENGTH") or "0")
     if length <= 0:
         return {}
     raw = sys.stdin.read(length)
-    content_type = os.environ.get("CONTENT_TYPE", "")
-    if "application/json" in content_type:
-        try:
-            return json.loads(raw or "{}")
-        except json.JSONDecodeError as exc:
-            raise ApiError("invalid_json", str(exc))
-    parsed = parse_qs(raw, keep_blank_values=True)
-    return {key: values[-1] for key, values in parsed.items()}
+    return parse_request_body(raw, os.environ.get("CONTENT_TYPE", ""))
 
 
 def query_params():
     parsed = parse_qs(os.environ.get("QUERY_STRING", ""), keep_blank_values=True)
-    return {key: values[-1] for key, values in parsed.items()}
+    return flatten_params(parsed)
 
 
 def validate_uint(value, key, min_value, max_value):
@@ -560,7 +599,9 @@ def write_attr(device, attr, value, required=False):
     try:
         path.write_text(str(value), encoding="utf-8")
     except OSError as exc:
-        raise ApiError("radio_write_failed", f"failed writing {attr}: {exc}", status=503)
+        if required:
+            raise ApiError("radio_write_failed", f"failed writing {attr}: {exc}", status=503)
+        return {"attr": attr, "value": str(value), "status": "error", "error": str(exc)}
     return {"attr": attr, "value": str(value), "status": "ok"}
 
 
@@ -600,7 +641,7 @@ def apply_profile(payload):
     writes = [
         write_attr(device, "out_altvoltage0_RX_LO_frequency", frequency, required=True),
         write_attr(device, "in_voltage_rf_bandwidth", profile["rf_bandwidth_hz"], required=True),
-        write_attr(device, "in_voltage_sampling_frequency", profile["sample_rate_hz"], required=True),
+        write_attr(device, "in_voltage_sampling_frequency", profile["sample_rate_hz"]),
         write_attr(device, "in_voltage0_gain_control_mode", gain_mode, required=True),
         write_attr(device, "in_voltage1_gain_control_mode", gain_mode),
     ]
@@ -1016,6 +1057,7 @@ def stream_audio(format_name, params):
         print("Content-Type: audio/L16" if format_name == "pcm" else "Content-Type: audio/wav")
         print("Cache-Control: no-store")
         print()
+        sys.stdout.flush()
     if format_name == "wav":
         sys.stdout.buffer.write(wav_header(bytes_remaining, rate))
     fd = os.open(str(AUDIO_FIFO), os.O_RDONLY | os.O_NONBLOCK)
@@ -1190,13 +1232,14 @@ def spectrum_profile(payload):
     return active_profile_from_state()
 
 
-def simulated_spectrum(center_hz, span_hz, bins, top_n):
+def simulated_spectrum(center_hz, span_hz, bins, top_n, sequence=0):
     start_hz = center_hz - span_hz // 2
     step_hz = span_hz / max(1, bins - 1)
+    drift = (sequence % 24) - 12
     carriers = (
-        (center_hz - span_hz * 0.18, -49.0),
-        (center_hz + span_hz * 0.07, -42.0),
-        (center_hz + span_hz * 0.31, -56.0),
+        (center_hz - span_hz * 0.18 + drift * step_hz * 0.20, -49.0),
+        (center_hz + span_hz * 0.07 - drift * step_hz * 0.15, -42.0),
+        (center_hz + span_hz * 0.31 + drift * step_hz * 0.10, -56.0),
     )
     points = []
     for idx in range(bins):
@@ -1215,6 +1258,69 @@ def simulated_spectrum(center_hz, span_hz, bins, top_n):
     return points, peaks, noise_floor
 
 
+def doppler_center_from_plan(plan, now_ms):
+    if not plan:
+        return None
+    table = plan.get("doppler_table", [])
+    if not table:
+        return None
+    start_ms = int(plan.get("start_epoch_ms") or 0)
+    elapsed_ms = int(now_ms) - start_ms
+    before = None
+    after = None
+    for point in table:
+        offset_ms = int(point.get("offset_ms") or 0)
+        frequency_hz = int(point.get("frequency_hz") or 0)
+        if frequency_hz <= 0:
+            continue
+        if offset_ms <= elapsed_ms:
+            before = (offset_ms, frequency_hz)
+        if offset_ms >= elapsed_ms:
+            after = (offset_ms, frequency_hz)
+            break
+    if before and after:
+        if after[0] == before[0]:
+            return before[1]
+        ratio = (elapsed_ms - before[0]) / max(1, after[0] - before[0])
+        return int(round(before[1] + ((after[1] - before[1]) * ratio)))
+    if before:
+        return before[1]
+    if after:
+        return after[1]
+    return None
+
+
+def write_spectrum_doppler_file(plan):
+    table = plan.get("doppler_table", []) if plan else []
+    if not table:
+        return None
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(STATE_DIR), prefix="spectrum-doppler-", suffix=".csv", delete=False)
+    try:
+        for point in table:
+            handle.write(f"{int(point.get('offset_ms') or 0)} {int(point.get('frequency_hz') or 0)}\n")
+        return Path(handle.name)
+    finally:
+        handle.close()
+
+
+def spectrum_request(payload):
+    profile = spectrum_profile(payload)
+    current_state = load_state()
+    center_hz = validate_uint(
+        payload.get("center_frequency_hz") or payload.get("frequency_hz") or current_state.get("requested_frequency_hz") or profile["default_frequency_hz"],
+        "center_frequency_hz",
+        70_000_000,
+        6_000_000_000,
+    )
+    span_hz = validate_uint(payload.get("span_hz", profile.get("rf_bandwidth_hz", 200_000)), "span_hz", 1_000, 56_000_000)
+    bins = validate_uint(payload.get("bins", 256), "bins", 16, SPECTRUM_MAX_BINS)
+    top_n = validate_uint(payload.get("top_n", 5), "top_n", 1, SPECTRUM_MAX_TOP_N)
+    simulate = dry_run() or str(payload.get("simulate", "")).lower() in {"1", "true", "yes"}
+    sample_rate = read_attr(find_iio_device(), "in_voltage_sampling_frequency") or profile.get("sample_rate_hz", "")
+    return profile, center_hz, span_hz, bins, top_n, sample_rate, simulate
+
+
 def spectrum_status():
     state = load_spectrum_state()
     return {
@@ -1230,23 +1336,13 @@ def spectrum_status():
             "last_error": state.get("last_error"),
             "max_bins": SPECTRUM_MAX_BINS,
             "max_top_n": SPECTRUM_MAX_TOP_N,
+            "max_stream_frames": SPECTRUM_MAX_STREAM_FRAMES,
         },
     }
 
 
 def spectrum_snapshot(payload):
-    profile = spectrum_profile(payload)
-    current_state = load_state()
-    center_hz = validate_uint(
-        payload.get("center_frequency_hz") or payload.get("frequency_hz") or current_state.get("requested_frequency_hz") or profile["default_frequency_hz"],
-        "center_frequency_hz",
-        70_000_000,
-        6_000_000_000,
-    )
-    span_hz = validate_uint(payload.get("span_hz", profile.get("rf_bandwidth_hz", 200_000)), "span_hz", 1_000, 56_000_000)
-    bins = validate_uint(payload.get("bins", 256), "bins", 16, SPECTRUM_MAX_BINS)
-    top_n = validate_uint(payload.get("top_n", 5), "top_n", 1, SPECTRUM_MAX_TOP_N)
-    simulate = dry_run() or str(payload.get("simulate", "")).lower() in {"1", "true", "yes"}
+    profile, center_hz, span_hz, bins, top_n, sample_rate, simulate = spectrum_request(payload)
 
     if simulate:
         points, peaks, noise_floor = simulated_spectrum(center_hz, span_hz, bins, top_n)
@@ -1267,6 +1363,7 @@ def spectrum_snapshot(payload):
                 "PLUTO_SPECTRUM_BINS": str(bins),
                 "PLUTO_SPECTRUM_TOP_N": str(top_n),
                 "PLUTO_SPECTRUM_PROFILE": profile["name"],
+                "PLUTO_SPECTRUM_SAMPLE_RATE_HZ": str(sample_rate),
             }
         )
         proc = subprocess.run([str(SPECTRUM_BACKEND)], check=False, capture_output=True, text=True, env=env, timeout=10)
@@ -1320,6 +1417,141 @@ def spectrum_top(payload):
             "backend": snapshot["backend"],
         },
     }
+
+
+def spectrum_stream_to_writer(payload, write_line, before_stream=None):
+    profile, center_hz, span_hz, bins, top_n, sample_rate, simulate = spectrum_request(payload)
+    frames = validate_uint(payload.get("frames", 120), "frames", 1, SPECTRUM_MAX_STREAM_FRAMES)
+    interval_ms = validate_uint(payload.get("interval_ms", 250), "interval_ms", 50, 60000)
+    follow_doppler = validate_bool(payload.get("follow_doppler", False), "follow_doppler")
+    doppler_plan_for_stream = None
+    doppler_table_file = None
+    if follow_doppler:
+        doppler_state = load_doppler_state()
+        doppler_plan_for_stream = doppler_state.get("plan")
+        if not doppler_plan_for_stream:
+            raise ApiError("no_doppler_plan", "load a Doppler plan before starting a Doppler-following spectrum stream", status=409)
+        center_hz = doppler_center_from_plan(doppler_plan_for_stream, int(time.time() * 1000)) or center_hz
+
+    if not simulate and (not SPECTRUM_BACKEND.is_file() or not os.access(str(SPECTRUM_BACKEND), os.X_OK)):
+        message = f"spectrum backend is not installed: {SPECTRUM_BACKEND}"
+        save_spectrum_state(
+            state="error",
+            last_error={"code": "spectrum_backend_missing", "message": message, "time_utc": now_utc()},
+        )
+        raise ApiError("spectrum_backend_missing", message, status=503)
+
+    if before_stream:
+        before_stream()
+
+    save_spectrum_state(
+        state="streaming",
+        profile=profile["name"],
+        center_frequency_hz=center_hz,
+        span_hz=span_hz,
+        bins=bins,
+        follow_doppler=follow_doppler,
+        backend="simulated_stream" if simulate else "external_stream",
+        last_error=None,
+    )
+
+    try:
+        if simulate:
+            for sequence in range(frames):
+                frame_center_hz = center_hz
+                if follow_doppler and doppler_plan_for_stream:
+                    frame_center_hz = doppler_center_from_plan(doppler_plan_for_stream, int(time.time() * 1000)) or center_hz
+                points, peaks, noise_floor = simulated_spectrum(frame_center_hz, span_hz, bins, top_n, sequence)
+                write_line(
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "type": "spectrum_row",
+                            "sequence": sequence,
+                            "time_epoch": int(time.time()),
+                            "sample_count": 0,
+                            "sample_rate_hz": int(sample_rate or 0),
+                            "center_frequency_hz": frame_center_hz,
+                            "span_hz": span_hz,
+                            "bins": bins,
+                            "backend": "simulated_stream",
+                            "bounded": False,
+                            "follow_doppler": follow_doppler,
+                            "points": points,
+                            "peaks": peaks,
+                            "noise_floor_dbfs": noise_floor,
+                        },
+                        sort_keys=True,
+                    )
+                )
+                if sequence + 1 < frames:
+                    time.sleep(interval_ms / 1000.0)
+        else:
+            if follow_doppler and doppler_plan_for_stream:
+                doppler_table_file = write_spectrum_doppler_file(doppler_plan_for_stream)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PLUTO_SPECTRUM_CENTER_HZ": str(center_hz),
+                    "PLUTO_SPECTRUM_SPAN_HZ": str(span_hz),
+                    "PLUTO_SPECTRUM_BINS": str(bins),
+                    "PLUTO_SPECTRUM_TOP_N": str(top_n),
+                    "PLUTO_SPECTRUM_PROFILE": profile["name"],
+                    "PLUTO_SPECTRUM_SAMPLE_RATE_HZ": str(sample_rate),
+                    "PLUTO_SPECTRUM_STREAM": "1",
+                    "PLUTO_SPECTRUM_FRAMES": str(frames),
+                    "PLUTO_SPECTRUM_INTERVAL_MS": str(interval_ms),
+                }
+            )
+            if follow_doppler and doppler_plan_for_stream and doppler_table_file:
+                env.update(
+                    {
+                        "PLUTO_SPECTRUM_DOPPLER_FILE": str(doppler_table_file),
+                        "PLUTO_SPECTRUM_DOPPLER_START_EPOCH_MS": str(doppler_plan_for_stream.get("start_epoch_ms", "")),
+                    }
+                )
+            proc = subprocess.Popen([str(SPECTRUM_BACKEND)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, bufsize=1)
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                write_line(line)
+            stderr = proc.stderr.read() if proc.stderr is not None else ""
+            rc = proc.wait()
+            if rc != 0:
+                raise ApiError("spectrum_stream_failed", "spectrum backend stream failed", status=503, details={"returncode": rc, "stderr": stderr[-300:]})
+    finally:
+        save_spectrum_state(
+            state="idle",
+            profile=profile["name"],
+            center_frequency_hz=center_hz,
+            span_hz=span_hz,
+            bins=bins,
+            follow_doppler=follow_doppler,
+            backend="simulated_stream" if simulate else "external_stream",
+            last_snapshot_utc=now_utc(),
+        )
+        if doppler_table_file:
+            try:
+                doppler_table_file.unlink()
+            except OSError:
+                pass
+
+
+def spectrum_stream(payload):
+    def headers():
+        if is_cgi():
+            print("Content-Type: application/x-ndjson")
+            print("Cache-Control: no-store")
+            print()
+            sys.stdout.flush()
+
+    def write_line(line):
+        print(line)
+        sys.stdout.flush()
+
+    spectrum_stream_to_writer(payload, write_line, headers)
 
 
 def loopback_status():
@@ -2352,6 +2584,296 @@ def disk_usage(path):
     return {"total_bytes": usage.total, "used_bytes": usage.used, "free_bytes": usage.free}
 
 
+def read_first_line(path):
+    try:
+        return Path(path).read_text(encoding="utf-8").splitlines()[0]
+    except (OSError, IndexError):
+        return ""
+
+
+def df_line(path):
+    usage = disk_usage(path)
+    if not usage:
+        return ""
+    total = usage["total_bytes"] // 1024
+    used = usage["used_bytes"] // 1024
+    free = usage["free_bytes"] // 1024
+    percent = int((used * 100) / total) if total else 0
+    return f"{total},{used},{free},{percent}%"
+
+
+def net_stat(iface, stat):
+    return read_first_line(f"/sys/class/net/{iface}/statistics/{stat}")
+
+
+def ip_addr(iface):
+    try:
+        proc = subprocess.run(["/sbin/ifconfig", iface], check=False, capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    match = re.search(r"inet addr:([0-9.]+)", proc.stdout)
+    if match:
+        return match.group(1)
+    match = re.search(r"\binet ([0-9.]+)", proc.stdout)
+    return match.group(1) if match else ""
+
+
+def iface_mode(iface):
+    try:
+        lines = Path("/etc/network/interfaces").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return "unknown"
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 4 and parts[0] == "iface" and parts[1] == iface:
+            return parts[3]
+    return "unknown"
+
+
+def lease_entries(path):
+    entries = []
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return entries
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 2 and re.match(r"^[0-9a-fA-F][0-9a-fA-F]:", parts[0]):
+            entries.append((parts[0], parts[1]))
+    return entries
+
+
+def web_metrics():
+    phy = find_iio_device()
+    mem = meminfo()
+    leases = lease_entries("/var/lib/misc/udhcpd-eth0.leases")
+    try:
+        versions = Path("/opt/VERSIONS").read_text(encoding="utf-8").replace("\n", ";")
+    except OSError:
+        versions = ""
+    try:
+        uptime_seconds = str(int(float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])))
+    except (OSError, IndexError, ValueError):
+        uptime_seconds = ""
+    return {
+        "system": {
+            "hostname": socket.gethostname(),
+            "uptime_seconds": uptime_seconds,
+            "loadavg": read_first_line("/proc/loadavg"),
+            "mem_total_kb": str(mem.get("memtotal_kb", "")),
+            "mem_available_kb": str(mem.get("memavailable_kb", "")),
+            "root_df_kb": df_line("/"),
+            "jffs2_df_kb": df_line("/mnt/jffs2"),
+            "versions": versions,
+        },
+        "network": {
+            "usb0_ip": ip_addr("usb0"),
+            "usb0_rx_bytes": net_stat("usb0", "rx_bytes"),
+            "usb0_tx_bytes": net_stat("usb0", "tx_bytes"),
+            "eth0_ip": ip_addr("eth0"),
+            "eth0_mode": iface_mode("eth0"),
+            "eth0_operstate": read_first_line("/sys/class/net/eth0/operstate"),
+            "eth0_carrier": read_first_line("/sys/class/net/eth0/carrier"),
+            "eth0_rx_bytes": net_stat("eth0", "rx_bytes"),
+            "eth0_tx_bytes": net_stat("eth0", "tx_bytes"),
+            "eth0_dhcp_server_active": "1" if Path("/etc/udhcpd-eth0.conf").is_file() else "0",
+            "eth0_dhcp_lease_count": str(len(leases)),
+            "eth0_dhcp_clients": ";".join(f"{mac},{addr}" for mac, addr in leases),
+        },
+        "radio": {
+            "phy_path": str(phy or ""),
+            "ensm_mode": read_attr(phy, "ensm_mode") or "",
+            "rx_lo_hz": read_attr(phy, "out_altvoltage0_RX_LO_frequency") or "",
+            "tx_lo_hz": read_attr(phy, "out_altvoltage1_TX_LO_frequency") or "",
+            "rx_sample_rate_hz": read_attr(phy, "in_voltage_sampling_frequency") or "",
+            "tx_sample_rate_hz": read_attr(phy, "out_voltage_sampling_frequency") or "",
+            "rx_rf_bandwidth_hz": read_attr(phy, "in_voltage_rf_bandwidth") or "",
+            "tx_rf_bandwidth_hz": read_attr(phy, "out_voltage_rf_bandwidth") or "",
+            "rx_gain_control_mode_ch0": read_attr(phy, "in_voltage0_gain_control_mode") or "",
+            "rx_gain_control_mode_ch1": read_attr(phy, "in_voltage1_gain_control_mode") or "",
+            "rx_hardwaregain_db_ch0": read_attr(phy, "in_voltage0_hardwaregain") or "",
+            "rx_hardwaregain_db_ch1": read_attr(phy, "in_voltage1_hardwaregain") or "",
+            "tx_hardwaregain_db_ch0": read_attr(phy, "out_voltage0_hardwaregain") or "",
+            "tx_hardwaregain_db_ch1": read_attr(phy, "out_voltage1_hardwaregain") or "",
+            "rx_rssi_ch0": read_attr(phy, "in_voltage0_rssi") or "",
+            "rx_rssi_ch1": read_attr(phy, "in_voltage1_rssi") or "",
+            "rx_channel0_present": "1" if phy and (phy / "in_voltage0_hardwaregain").exists() else "0",
+            "rx_channel1_present": "1" if phy and (phy / "in_voltage1_hardwaregain").exists() else "0",
+            "tx_channel0_present": "1" if phy and (phy / "out_voltage0_hardwaregain").exists() else "0",
+            "tx_channel1_present": "1" if phy and (phy / "out_voltage1_hardwaregain").exists() else "0",
+            "temperature_raw": read_attr(phy, "temp0_input") or "",
+        },
+    }
+
+
+def web_setting_valid(key, value):
+    try:
+        if key in {"rx_lo_hz", "tx_lo_hz"}:
+            validate_uint(value, key, 70_000_000, 6_000_000_000)
+        elif key in {"rx_sample_rate_hz", "tx_sample_rate_hz"}:
+            validate_uint(value, key, 520_000, 61_440_000)
+        elif key in {"rx_rf_bandwidth_hz", "tx_rf_bandwidth_hz"}:
+            validate_uint(value, key, 200_000, 56_000_000)
+        elif key == "rx_gain_control_mode":
+            if value not in GAIN_MODES:
+                return False
+        elif key in {"rx_hardwaregain_db", "tx_hardwaregain_db"}:
+            validate_decimal(value, key)
+        elif key == "ensm_mode":
+            if value not in {"sleep", "alert", "fdd", "pinctrl", "rx", "tx"}:
+                return False
+        else:
+            return False
+    except ApiError:
+        return False
+    return True
+
+
+def web_settings_current():
+    phy = find_iio_device()
+    return {
+        "rx_lo_hz": read_attr(phy, "out_altvoltage0_RX_LO_frequency") or "",
+        "tx_lo_hz": read_attr(phy, "out_altvoltage1_TX_LO_frequency") or "",
+        "rx_sample_rate_hz": read_attr(phy, "in_voltage_sampling_frequency") or "",
+        "tx_sample_rate_hz": read_attr(phy, "out_voltage_sampling_frequency") or "",
+        "rx_rf_bandwidth_hz": read_attr(phy, "in_voltage_rf_bandwidth") or "",
+        "tx_rf_bandwidth_hz": read_attr(phy, "out_voltage_rf_bandwidth") or "",
+        "rx_gain_control_mode": read_attr(phy, "in_voltage0_gain_control_mode") or "",
+        "rx_hardwaregain_db": read_attr(phy, "in_voltage0_hardwaregain") or "",
+        "tx_hardwaregain_db": read_attr(phy, "out_voltage0_hardwaregain") or "",
+        "ensm_mode": read_attr(phy, "ensm_mode") or "",
+    }
+
+
+def web_settings_persisted():
+    persisted = {}
+    try:
+        lines = WEB_SETTINGS_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return persisted
+    for line in lines:
+        key, sep, value = line.partition("=")
+        if sep and web_setting_valid(key, value):
+            persisted[key] = value
+    return persisted
+
+
+def web_settings_get():
+    return {
+        "ok": True,
+        "persisted": web_settings_persisted(),
+        "current": web_settings_current(),
+        "schema": list(WEB_SETTINGS_SCHEMA),
+    }
+
+
+def web_settings_post(payload):
+    if not Path("/mnt/jffs2").is_dir():
+        return {"ok": False, "error": "jffs2_not_mounted"}
+    if dry_run():
+        return {"ok": True, "apply": "dry_run"}
+    try:
+        WEB_SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = WEB_SETTINGS_FILE.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as handle:
+            for key, value in sorted(payload.items()):
+                if web_setting_valid(key, str(value)):
+                    handle.write(f"{key}={value}\n")
+        os.replace(str(tmp), str(WEB_SETTINGS_FILE))
+        WEB_SETTINGS_FILE.chmod(0o600)
+    except OSError:
+        return {"ok": False, "error": "settings_write_failed"}
+    apply_status = "skipped"
+    if WEB_SETTINGS_APPLY.is_file() and os.access(str(WEB_SETTINGS_APPLY), os.X_OK):
+        proc = subprocess.run([str(WEB_SETTINGS_APPLY)], check=False)
+        apply_status = "ok" if proc.returncode == 0 else "failed"
+    return {"ok": True, "apply": apply_status}
+
+
+def clean_web_rel(value):
+    rel = (value or "").strip()
+    if rel in {"", "."}:
+        return ""
+    if rel.startswith("/") or ".." in Path(rel).parts:
+        raise ApiError("bad_path", "file path is outside the selected root", status=400)
+    if re.search(r"[`\"$\\;|&<>]", rel):
+        raise ApiError("bad_path", "file path contains unsupported characters", status=400)
+    return str(Path(rel))
+
+
+def web_file_target(root_name, rel):
+    base = WEB_FILE_ROOTS.get(root_name)
+    if not base:
+        raise ApiError("bad_root", "unknown file root", status=400)
+    clean_rel = clean_web_rel(rel)
+    target = base / clean_rel if clean_rel else base
+    try:
+        resolved_base = base.resolve()
+        resolved_target = target.resolve()
+    except OSError:
+        resolved_base = base
+        resolved_target = target
+    try:
+        common = os.path.commonpath([str(resolved_base), str(resolved_target)])
+    except ValueError:
+        common = ""
+    if common != str(resolved_base):
+        raise ApiError("bad_path", "file path is outside the selected root", status=400)
+    return base, target, clean_rel
+
+
+def web_file_type(path):
+    if path.is_dir():
+        return "dir"
+    if path.is_symlink():
+        return "link"
+    if path.is_file():
+        return "file"
+    return "other"
+
+
+def web_file_size(path):
+    try:
+        return str(path.stat().st_size if path.is_file() else 0)
+    except OSError:
+        return "0"
+
+
+def web_files(payload):
+    root_name = payload.get("root") or "jffs2"
+    base, target, rel = web_file_target(root_name, payload.get("path") or "")
+    action = payload.get("action") or "list"
+    if action == "read":
+        if not target.is_file():
+            return {"ok": False, "error": "not_file"}
+        try:
+            data = target.read_bytes()
+        except OSError:
+            return {"ok": False, "error": "read_failed"}
+        truncated = len(data) > 32768
+        text = data[:32768].decode("utf-8", "replace")
+        return {"ok": True, "root": root_name, "path": rel, "size": str(len(data)), "truncated": "1" if truncated else "0", "content": text}
+    if not target.is_dir():
+        return {"ok": False, "error": "not_directory"}
+    entries = []
+    try:
+        children = sorted(target.iterdir(), key=lambda item: item.name)
+    except OSError:
+        children = []
+    for item in children:
+        entries.append({"name": item.name, "type": web_file_type(item), "size": web_file_size(item)})
+    return {"ok": True, "root": root_name, "path": rel, "base": str(base), "entries": entries}
+
+
+def api_mode():
+    configured = os.environ.get("PLUTO_RADIO_API_MODE")
+    if configured:
+        return configured
+    if is_cgi():
+        return "busybox-httpd-cgi"
+    return "python-cli"
+
+
 def system_health():
     try:
         uptime_seconds = int(float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0]))
@@ -2372,7 +2894,7 @@ def system_health():
             "meminfo": meminfo(),
             "storage": {"/": disk_usage("/"), "/mnt/jffs2": disk_usage("/mnt/jffs2")},
             "firmware_versions": versions,
-            "api_mode": "busybox-httpd-cgi",
+            "api_mode": api_mode(),
             "api_version": "0.1",
         },
         "radio": status["radio"],
@@ -2387,6 +2909,198 @@ def system_health():
         "doppler": doppler_status()["doppler"],
         "iio": status["iio"],
     }
+
+
+def send_http_json(handler, payload, status=200):
+    body = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def stream_audio_http(handler, format_name, params):
+    status = audio_status()["audio"]
+    if status["state"] != "running":
+        raise ApiError("audio_not_running", "audio stream is not running", status=409)
+    if dry_run():
+        raise ApiError("audio_stream_unavailable", "audio streaming is unavailable in dry-run mode", status=503)
+    rate = int(status.get("audio_rate_hz") or 48000)
+    seconds = validate_uint(params.get("seconds", 2), "seconds", 1, 10)
+    bytes_remaining = rate * 2 * seconds
+    handler.send_response(200)
+    handler.send_header("Content-Type", "audio/L16" if format_name == "pcm" else "audio/wav")
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    if format_name == "wav":
+        handler.wfile.write(wav_header(bytes_remaining, rate))
+        handler.wfile.flush()
+    fd = os.open(str(AUDIO_FIFO), os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        deadline = time.time() + seconds
+        while bytes_remaining > 0 and time.time() < deadline:
+            try:
+                chunk = os.read(fd, min(4096, bytes_remaining))
+            except BlockingIOError:
+                time.sleep(0.02)
+                continue
+            if not chunk:
+                time.sleep(0.02)
+                continue
+            handler.wfile.write(chunk)
+            handler.wfile.flush()
+            bytes_remaining -= len(chunk)
+    finally:
+        os.close(fd)
+
+
+def spectrum_stream_http(handler, payload):
+    def headers():
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/x-ndjson")
+        handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+
+    def write_line(line):
+        handler.wfile.write((line + "\n").encode("utf-8"))
+        handler.wfile.flush()
+
+    spectrum_stream_to_writer(payload, write_line, headers)
+
+
+def download_capture_http(handler, params):
+    capture_id = validate_capture_id(params.get("capture_id", ""))
+    data_path, _meta_path = capture_paths(capture_id, params)
+    if not data_path.is_file():
+        raise ApiError("capture_not_found", "capture data was not found", status=404, details={"capture_id": capture_id})
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/octet-stream")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Disposition", f'attachment; filename="{capture_id}.bin"')
+    try:
+        handler.send_header("Content-Length", str(data_path.stat().st_size))
+    except OSError:
+        pass
+    handler.end_headers()
+    with data_path.open("rb") as handle:
+        shutil.copyfileobj(handle, handler.wfile)
+
+
+def http_request_path_and_query(request_path):
+    parsed_url = urlsplit(request_path)
+    query = flatten_params(parse_qs(parsed_url.query, keep_blank_values=True))
+    path = parsed_url.path or "/"
+    if path == "/cgi-bin/pluto-radio-api":
+        path = query.get("path") or query.get("op") or ""
+    elif path.startswith("/cgi-bin/pluto-radio-api/"):
+        path = path[len("/cgi-bin/pluto-radio-api") :]
+    if path and not path.startswith("/"):
+        path = "/" + path
+    return path, query
+
+
+class RadioApiHttpServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+
+class RadioApiHttpHandler(BaseHTTPRequestHandler):
+    server_version = "PlutoRadioAPI/0.1"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - - [%s] %s\n" % (self.client_address[0], self.log_date_time_string(), fmt % args))
+
+    def do_GET(self):
+        self.handle_api()
+
+    def do_POST(self):
+        self.handle_api()
+
+    def do_PUT(self):
+        self.handle_api()
+
+    def do_PATCH(self):
+        self.handle_api()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Allow", "GET, POST, PUT, PATCH, OPTIONS")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def read_payload(self, method, query):
+        payload = dict(query)
+        if method not in {"POST", "PUT", "PATCH"}:
+            return payload
+        length = int(self.headers.get("Content-Length") or "0")
+        raw = self.rfile.read(length) if length > 0 else b""
+        body = parse_request_body(raw, self.headers.get("Content-Type", ""))
+        payload.update(body)
+        return payload
+
+    def handle_api(self):
+        method = self.command.upper()
+        path, query = http_request_path_and_query(self.path)
+        try:
+            payload = self.read_payload(method, query)
+            if method == "GET" and path in {"/radio/audio/live.pcm", "/audio/live.pcm"}:
+                stream_audio_http(self, "pcm", payload)
+                return
+            if method == "GET" and path in {"/radio/audio/live.wav", "/audio/live.wav"}:
+                stream_audio_http(self, "wav", payload)
+                return
+            if method == "GET" and path in {"/radio/spectrum/stream", "/spectrum/stream"}:
+                spectrum_stream_http(self, payload)
+                return
+            if method == "GET" and path in {"/capture/download"}:
+                download_capture_http(self, payload)
+                return
+            send_http_json(self, route(method, path, payload))
+        except ApiError as exc:
+            if exc.code.startswith("audio_"):
+                fail_audio_state(exc.code, exc.message)
+            fail_state(exc.code, exc.message)
+            send_http_json(self, {"ok": False, "error": exc.code, "message": exc.message, "details": exc.details}, exc.status)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception as exc:
+            fail_state("internal_error", str(exc))
+            send_http_json(self, {"ok": False, "error": "internal_error", "message": str(exc)}, 500)
+
+
+def run_http_server(argv):
+    host = "127.0.0.1"
+    port = 8081
+    args = list(argv[2:])
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--host" and index + 1 < len(args):
+            host = args[index + 1]
+            index += 2
+            continue
+        if arg == "--port" and index + 1 < len(args):
+            port = int(args[index + 1])
+            index += 2
+            continue
+        if arg.startswith("--host="):
+            host = arg.split("=", 1)[1]
+        elif arg.startswith("--port="):
+            port = int(arg.split("=", 1)[1])
+        elif arg.startswith("host="):
+            host = arg.split("=", 1)[1]
+        elif arg.startswith("port="):
+            port = int(arg.split("=", 1)[1])
+        else:
+            raise ApiError("usage", "usage: pluto-radio-api serve [host=127.0.0.1] [port=8081]", status=2)
+        index += 1
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    server = RadioApiHttpServer((host, port), RadioApiHttpHandler)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
 
 
 def cgi_path():
@@ -2404,6 +3118,12 @@ def route(method, path, payload):
         return list_profiles()
     if method == "GET" and path in {"/system/health", "/health"}:
         return system_health()
+    if method == "GET" and path in {"/system/metrics", "/dashboard/metrics", "/cgi-bin/pluto-metrics.cgi"}:
+        return web_metrics()
+    if method == "GET" and path in {"/system/settings", "/dashboard/settings", "/cgi-bin/pluto-settings.cgi"}:
+        return web_settings_get()
+    if method == "GET" and path in {"/system/files", "/dashboard/files", "/cgi-bin/pluto-files.cgi"}:
+        return web_files(payload)
     if method == "GET" and path in {"/system/logs", "/logs"}:
         return system_logs(payload)
     if method == "GET" and path in {"/system/watchdog", "/watchdog"}:
@@ -2418,6 +3138,8 @@ def route(method, path, payload):
         return spectrum_snapshot(payload)
     if method == "GET" and path in {"/radio/spectrum/top", "/spectrum/top"}:
         return spectrum_top(payload)
+    if method == "GET" and path in {"/radio/spectrum/stream", "/spectrum/stream"}:
+        raise ApiError("stream_requires_direct_handler", "spectrum stream must be handled as a streaming response", status=500)
     if method == "GET" and path in {"/radio/doppler/status", "/doppler/status"}:
         return doppler_status()
     if method == "GET" and path in {"/radio/loopback/status", "/loopback/status"}:
@@ -2436,6 +3158,8 @@ def route(method, path, payload):
         return apply_profile(payload)
     if method == "POST" and path in {"/radio/tune", "/tune"}:
         return tune(payload)
+    if method == "POST" and path in {"/system/settings", "/dashboard/settings", "/cgi-bin/pluto-settings.cgi"}:
+        return web_settings_post(payload)
     if method == "POST" and path in {"/radio/stop", "/stop"}:
         return stop_radio()
     if method == "POST" and path in {"/radio/audio/start", "/audio/start"}:
@@ -2485,6 +3209,9 @@ def run_cgi():
     if method == "GET" and path in {"/radio/audio/live.wav", "/audio/live.wav"}:
         stream_audio("wav", payload)
         return
+    if method == "GET" and path in {"/radio/spectrum/stream", "/spectrum/stream"}:
+        spectrum_stream(payload)
+        return
     if method == "GET" and path in {"/capture/download"}:
         download_capture(payload)
         return
@@ -2493,8 +3220,11 @@ def run_cgi():
 
 def run_cli(argv):
     if len(argv) < 2:
-        raise ApiError("usage", "usage: pluto-radio-api status|health|logs|profiles|apply|tune|stop|audio-start|audio-stop|audio-status|watchdog-status|watchdog-check|capture-start|capture-list|capture-delete|spectrum-status|spectrum-snapshot|spectrum-top|loopback-status|loopback-start|tx-status|tx-guardrails|tx-start|tx-stop|calibration-status|calibration-apply|self-test|self-test-status|doppler-status|doppler-plan|doppler-start|doppler-stop|doppler-tick", status=2)
+        raise ApiError("usage", "usage: pluto-radio-api serve|status|health|logs|profiles|apply|tune|stop|audio-start|audio-stop|audio-status|watchdog-status|watchdog-check|capture-start|capture-list|capture-delete|spectrum-status|spectrum-snapshot|spectrum-top|spectrum-stream|loopback-status|loopback-start|tx-status|tx-guardrails|tx-start|tx-stop|calibration-status|calibration-apply|self-test|self-test-status|doppler-status|doppler-plan|doppler-start|doppler-stop|doppler-tick", status=2)
     command = argv[1]
+    if command == "serve":
+        run_http_server(argv)
+        raise SystemExit(0)
     if command == "status":
         return radio_status()
     if command == "health":
@@ -2565,6 +3295,20 @@ def run_cli(argv):
         if len(argv) > 2 and not argv[2].startswith("--"):
             payload["profile"] = argv[2]
         return spectrum_top(payload)
+    if command == "spectrum-stream":
+        payload = {}
+        profile_set = False
+        for arg in argv[2:]:
+            if arg == "--simulate":
+                payload["simulate"] = "true"
+            elif "=" in arg:
+                key, value = arg.split("=", 1)
+                payload[key] = value
+            elif not profile_set:
+                payload["profile"] = arg
+                profile_set = True
+        spectrum_stream(payload)
+        raise SystemExit(0)
     if command == "loopback-status":
         return loopback_status()
     if command == "loopback-start":

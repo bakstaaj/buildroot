@@ -48,12 +48,12 @@ rm -f ${TARGET_DIR}/etc/init.d/S99iiod
 rm -Rf ${TARGET_DIR}/etc/dropbear
 
 mkdir -p ${TARGET_DIR}/www/img
-mkdir -p ${TARGET_DIR}/www/cgi-bin
 mkdir -p ${TARGET_DIR}/etc/pluto-radio/profiles
 mkdir -p ${TARGET_DIR}/etc/wpa_supplicant/
 mkdir -p ${TARGET_DIR}/mnt/jffs2
 mkdir -p ${TARGET_DIR}/mnt/msd
 mkdir -p ${TARGET_DIR}/etc/dropbear
+mkdir -p ${TARGET_DIR}/etc/lighttpd
 
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/update.sh ${TARGET_DIR}/sbin/
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/update_from_github.sh ${TARGET_DIR}/sbin/
@@ -70,6 +70,7 @@ ${INSTALL} -D -m 0755 ${BOARD_DIR}/S45msd ${TARGET_DIR}/etc/init.d/
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/S50dropbear ${TARGET_DIR}/etc/init.d/
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/S70pluto-radio-api ${TARGET_DIR}/etc/init.d/
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/S98autostart ${TARGET_DIR}/etc/init.d/
+${INSTALL} -D -m 0644 ${BOARD_DIR}/lighttpd.conf ${TARGET_DIR}/etc/lighttpd/lighttpd.conf
 ${INSTALL} -D -m 0644 ${BOARD_DIR}/fw_env.config ${TARGET_DIR}/etc/
 ${INSTALL} -D -m 0644 ${BOARD_DIR}/VERSIONS ${TARGET_DIR}/opt/
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/device_reboot ${TARGET_DIR}/usr/sbin/
@@ -98,8 +99,7 @@ ${INSTALL} -D -m 0644 ${BOARD_DIR}/msd/img/* ${TARGET_DIR}/www/img/
 ${INSTALL} -D -m 0644 ${BOARD_DIR}/msd/*.html ${TARGET_DIR}/www/
 ${INSTALL} -D -m 0644 ${BOARD_DIR}/web/*.html ${TARGET_DIR}/www/
 ${INSTALL} -D -m 0644 ${BOARD_DIR}/web/img/* ${TARGET_DIR}/www/img/
-${INSTALL} -D -m 0755 ${BOARD_DIR}/web/cgi-bin/* ${TARGET_DIR}/www/cgi-bin/
-${INSTALL} -D -m 0755 ${BOARD_DIR}/pluto-radio-api ${TARGET_DIR}/www/cgi-bin/pluto-radio-api
+rm -rf ${TARGET_DIR}/www/cgi-bin
 ${INSTALL} -D -m 0644 ${BOARD_DIR}/pluto-radio/profiles/*.json ${TARGET_DIR}/etc/pluto-radio/profiles/
 
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/wpa_supplicant/* ${TARGET_DIR}/etc/wpa_supplicant/
