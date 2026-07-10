@@ -49,6 +49,25 @@ sd_parent_disk() {
 	echo "$1" | sed 's/p[0-9][0-9]*$//'
 }
 
+ensure_dev_node() {
+	local dev="$1"
+	local info
+
+	[ -b "/dev/$dev" ] && return 0
+	info="$(awk -v dev="$dev" '$4 == dev { print $1 " " $2; exit }' /proc/partitions)"
+	[ -n "$info" ] || return 1
+
+	set -- $info
+	if mknod "/dev/$dev" b "$1" "$2" 2>/dev/null; then
+		chmod 660 "/dev/$dev" 2>/dev/null || true
+		log "created missing block node /dev/$dev ($1,$2)"
+		return 0
+	fi
+
+	log "failed to create missing block node /dev/$dev ($1,$2)"
+	return 1
+}
+
 is_mounted() {
 	grep -qs "^/dev/$1 " /proc/mounts
 }
@@ -327,7 +346,16 @@ prepare_dev() {
 	local dev="$1"
 	local fstype
 
-	[ -b "/dev/$dev" ] || return 0
+	if [ ! -b "/dev/$dev" ]; then
+		if is_sd_part "$dev"; then
+			ensure_dev_node "$dev" || {
+				log "missing block node /dev/$dev"
+				return 1
+			}
+		else
+			return 0
+		fi
+	fi
 	if is_sd_boot_part "$dev"; then
 		log "skipping SD boot partition /dev/$dev"
 		return 0
@@ -382,10 +410,9 @@ prepare_all_sd() {
 	local found=0
 	local dev
 
-	for path in /dev/mmcblk[0-9]p[0-9] /dev/mmcblk[0-9]p[0-9][0-9]; do
-		[ -b "$path" ] || continue
+	for dev in $(awk '$4 ~ /^mmcblk[0-9]+p[0-9]+$/ { print $4 }' /proc/partitions); do
 		found=1
-		dev="$(basename "$path")"
+		ensure_dev_node "$dev" || return 1
 		prepare_dev "$dev" || return 1
 	done
 
