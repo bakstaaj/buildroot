@@ -209,6 +209,10 @@ repair_fs() {
 	local dev="$1"
 	local fstype="$2"
 
+	if is_sd_part "$dev"; then
+		ensure_dev_node "$dev" || return 1
+	fi
+
 	if is_fat_type "$fstype"; then
 		fsck_fat "$dev"
 	elif is_ext_type "$fstype"; then
@@ -277,12 +281,14 @@ with open(mbr_path, "r+b", buffering=0) as handle:
 PY
 	probe_partitions "$disk"
 	sleep 1
+	ensure_dev_node "$dev" || return 1
 }
 
 format_data_partition() {
 	local dev="$1"
 
 	is_sd_data_part "$dev" || return 0
+	ensure_dev_node "$dev" || return 1
 	if [ -x "$mke2fs_bin" ]; then
 		"$mke2fs_bin" -t ext4 -L PLUTO_DATA -m 0 -O ^64bit -F "/dev/$dev"
 	elif command -v mke2fs >/dev/null 2>&1; then
@@ -297,6 +303,7 @@ resize_data_fs() {
 	local dev="$1"
 
 	is_sd_data_part "$dev" || return 0
+	ensure_dev_node "$dev" || return 1
 	if [ -x "$resize2fs_bin" ]; then
 		"$resize2fs_bin" "/dev/$dev" >/dev/null 2>&1 || true
 	elif command -v resize2fs >/dev/null 2>&1; then
@@ -321,6 +328,9 @@ mount_dev() {
 	local err
 	local rc
 
+	if is_sd_part "$dev"; then
+		ensure_dev_node "$dev" || return 1
+	fi
 	mp="$(mount_point "$dev")"
 	opts="$(mount_opts "$dev")"
 	mkdir -p "$mp" || return 1
