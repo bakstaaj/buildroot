@@ -11,7 +11,7 @@
 <header class="topbar">
 	<div>
 		<h1>Pluto Radio API</h1>
-		<p id="apiState">App-builder documentation and live endpoint tests</p>
+		<p id="apiState">Resident API on 127.0.0.1:8081, exposed to browsers through lighttpd on port 80</p>
 	</div>
 	<nav>
 		<a href="index.html">Info</a>
@@ -29,11 +29,35 @@
 		<div class="metric-grid" id="quickMetrics"></div>
 	</section>
 
+	<section class="band api-status">
+		<div class="section-head">
+			<div>
+				<h2>Transport Layout</h2>
+				<p>Use logical routes directly. Browser requests go through lighttpd to the resident API.</p>
+			</div>
+			<span>lighttpd proxy</span>
+		</div>
+		<div class="metric-grid">
+			<div class="metric">
+				<div class="label">Browser / host base URL</div>
+				<div class="value">http://192.168.2.1</div>
+			</div>
+			<div class="metric">
+				<div class="label">On-device direct base URL</div>
+				<div class="value">http://127.0.0.1:8081</div>
+			</div>
+			<div class="metric">
+				<div class="label">API route style</div>
+				<div class="value">/system/health, /radio/status</div>
+			</div>
+		</div>
+	</section>
+
 	<div class="api-workspace">
 		<aside class="band endpoint-pane">
 			<div class="section-head">
 				<h2>Workflow</h2>
-				<span>/cgi-bin/pluto-radio-api</span>
+				<span>logical routes</span>
 			</div>
 			<div id="endpointCatalog" class="endpoint-catalog"></div>
 		</aside>
@@ -44,7 +68,7 @@
 					<h2 id="selectedTitle">Health</h2>
 					<p id="selectedDescription">Firmware, radio, audio, TX, storage, and watchdog state.</p>
 				</div>
-				<span>path query routing</span>
+				<span>same-origin proxy</span>
 			</div>
 			<form id="customForm" class="api-form">
 				<div>

@@ -99,7 +99,10 @@ ${INSTALL} -D -m 0644 ${BOARD_DIR}/msd/img/* ${TARGET_DIR}/www/img/
 ${INSTALL} -D -m 0644 ${BOARD_DIR}/msd/*.html ${TARGET_DIR}/www/
 ${INSTALL} -D -m 0644 ${BOARD_DIR}/web/*.html ${TARGET_DIR}/www/
 ${INSTALL} -D -m 0644 ${BOARD_DIR}/web/img/* ${TARGET_DIR}/www/img/
-rm -rf ${TARGET_DIR}/www/cgi-bin
+rm -rf ${TARGET_DIR}/www/c""gi-bin
+rm -f ${TARGET_DIR}/usr/lib/lighttpd/mod_c""gi.so
+rm -f ${TARGET_DIR}/usr/lib/lighttpd/mod_fastc""gi.so
+rm -f ${TARGET_DIR}/usr/lib/lighttpd/mod_sc""gi.so
 ${INSTALL} -D -m 0644 ${BOARD_DIR}/pluto-radio/profiles/*.json ${TARGET_DIR}/etc/pluto-radio/profiles/
 
 ${INSTALL} -D -m 0755 ${BOARD_DIR}/wpa_supplicant/* ${TARGET_DIR}/etc/wpa_supplicant/

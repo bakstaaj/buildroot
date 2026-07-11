@@ -178,7 +178,7 @@ function renderMetrics(targetId, rows, data) {
 
 async function loadMetrics() {
   try {
-    const response = await fetch("/cgi-bin/pluto-metrics.cgi", { cache: "no-store" });
+    const response = await fetch("/system/metrics", { cache: "no-store" });
     if (!response.ok) throw new Error(`metrics HTTP ${response.status}`);
     const data = await response.json();
     renderMetrics("systemMetrics", metricGroups.system, data.system || {});
@@ -219,7 +219,7 @@ function fieldFor(item, value) {
 
 async function loadSettings() {
   text("settingsState", "Loading settings");
-  const response = await fetch("/cgi-bin/pluto-settings.cgi", { cache: "no-store" });
+  const response = await fetch("/system/settings", { cache: "no-store" });
   if (!response.ok) throw new Error(`settings HTTP ${response.status}`);
   const data = await response.json();
   const current = data.current || {};
@@ -236,7 +236,7 @@ async function saveSettings(event) {
   event.preventDefault();
   text("settingsState", "Saving");
   const body = new URLSearchParams(new FormData(event.target));
-  const response = await fetch("/cgi-bin/pluto-settings.cgi", {
+  const response = await fetch("/system/settings", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body,
@@ -254,7 +254,7 @@ async function loadFiles() {
     root: fileState.root,
     path: fileState.path,
   });
-  const response = await fetch(`/cgi-bin/pluto-files.cgi?${qs}`, { cache: "no-store" });
+  const response = await fetch(`/system/files?${qs}`, { cache: "no-store" });
   if (!response.ok) throw new Error(`files HTTP ${response.status}`);
   const data = await response.json();
   if (!data.ok) throw new Error(data.error || "files unavailable");
@@ -277,7 +277,7 @@ async function readFile(path) {
     root: fileState.root,
     path,
   });
-  const response = await fetch(`/cgi-bin/pluto-files.cgi?${qs}`, { cache: "no-store" });
+  const response = await fetch(`/system/files?${qs}`, { cache: "no-store" });
   if (!response.ok) throw new Error(`files HTTP ${response.status}`);
   const data = await response.json();
   if (!data.ok) throw new Error(data.error || "file unavailable");

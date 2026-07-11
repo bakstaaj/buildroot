@@ -1,4 +1,5 @@
-const apiBase = "/cgi-bin/pluto-radio-api";
+const browserApiBase = "";
+const plutoDirectBaseUrl = "http://127.0.0.1:8081";
 
 const endpoints = [
   {
@@ -223,8 +224,17 @@ function text(id, value) {
   document.getElementById(id).textContent = value;
 }
 
+function normalizePath(path) {
+  const clean = String(path || "/").trim() || "/";
+  return clean.startsWith("/") ? clean : `/${clean}`;
+}
+
 function endpointUrl(path) {
-  return `${apiBase}?path=${encodeURIComponent(path)}`;
+  return `${browserApiBase}${normalizePath(path)}`;
+}
+
+function directApiUrl(path) {
+  return `${plutoDirectBaseUrl}${normalizePath(path)}`;
 }
 
 function pretty(value) {
@@ -296,9 +306,12 @@ function renderQuick(data) {
 
 function renderRequestPreview() {
   const method = document.getElementById("method").value;
-  const path = document.getElementById("path").value.trim() || "/";
+  const path = normalizePath(document.getElementById("path").value);
   const body = method === "GET" ? "" : document.getElementById("payload").value.trim();
-  const lines = [`${method} ${endpointUrl(path)}`];
+  const lines = [
+    `Browser / host: ${method} ${endpointUrl(path)}`,
+    `On-device direct: ${method} ${directApiUrl(path)}`,
+  ];
   if (body) {
     lines.push("Content-Type: application/json", "", body);
   }

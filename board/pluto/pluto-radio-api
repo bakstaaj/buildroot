@@ -138,10 +138,6 @@ class ApiError(Exception):
         self.details = details or {}
 
 
-def is_cgi():
-    return "REQUEST_METHOD" in os.environ
-
-
 def dry_run():
     return os.environ.get("PLUTO_RADIO_DRY_RUN") == "1"
 
@@ -304,12 +300,6 @@ def fail_audio_state(code, message):
 
 
 def json_response(payload, status=200):
-    if is_cgi():
-        if status != 200:
-            print(f"Status: {status}")
-        print("Content-Type: application/json")
-        print("Cache-Control: no-store")
-        print()
     print(json.dumps(payload, sort_keys=True))
 
 
@@ -1053,11 +1043,6 @@ def stream_audio(format_name, params):
     rate = int(status.get("audio_rate_hz") or 48000)
     seconds = validate_uint(params.get("seconds", 2), "seconds", 1, 10)
     bytes_remaining = rate * 2 * seconds
-    if is_cgi():
-        print("Content-Type: audio/L16" if format_name == "pcm" else "Content-Type: audio/wav")
-        print("Cache-Control: no-store")
-        print()
-        sys.stdout.flush()
     if format_name == "wav":
         sys.stdout.buffer.write(wav_header(bytes_remaining, rate))
     fd = os.open(str(AUDIO_FIFO), os.O_RDONLY | os.O_NONBLOCK)
@@ -1214,11 +1199,6 @@ def download_capture(params):
     data_path, _meta_path = capture_paths(capture_id, params)
     if not data_path.is_file():
         raise ApiError("capture_not_found", "capture data was not found", status=404, details={"capture_id": capture_id})
-    if is_cgi():
-        print("Content-Type: application/octet-stream")
-        print("Cache-Control: no-store")
-        print(f"Content-Disposition: attachment; filename=\"{capture_id}.bin\"")
-        print()
     with data_path.open("rb") as handle:
         shutil.copyfileobj(handle, sys.stdout.buffer)
 
@@ -1540,18 +1520,11 @@ def spectrum_stream_to_writer(payload, write_line, before_stream=None):
 
 
 def spectrum_stream(payload):
-    def headers():
-        if is_cgi():
-            print("Content-Type: application/x-ndjson")
-            print("Cache-Control: no-store")
-            print()
-            sys.stdout.flush()
-
     def write_line(line):
         print(line)
         sys.stdout.flush()
 
-    spectrum_stream_to_writer(payload, write_line, headers)
+    spectrum_stream_to_writer(payload, write_line)
 
 
 def loopback_status():
@@ -2869,8 +2842,6 @@ def api_mode():
     configured = os.environ.get("PLUTO_RADIO_API_MODE")
     if configured:
         return configured
-    if is_cgi():
-        return "busybox-httpd-cgi"
     return "python-cli"
 
 
@@ -2992,10 +2963,6 @@ def http_request_path_and_query(request_path):
     parsed_url = urlsplit(request_path)
     query = flatten_params(parse_qs(parsed_url.query, keep_blank_values=True))
     path = parsed_url.path or "/"
-    if path == "/cgi-bin/pluto-radio-api":
-        path = query.get("path") or query.get("op") or ""
-    elif path.startswith("/cgi-bin/pluto-radio-api/"):
-        path = path[len("/cgi-bin/pluto-radio-api") :]
     if path and not path.startswith("/"):
         path = "/" + path
     return path, query
@@ -3103,14 +3070,6 @@ def run_http_server(argv):
         server.server_close()
 
 
-def cgi_path():
-    params = query_params()
-    path = os.environ.get("PATH_INFO") or params.get("path") or params.get("op") or ""
-    if path and not path.startswith("/"):
-        path = "/" + path
-    return path
-
-
 def route(method, path, payload):
     if method == "GET" and path in {"/radio/status", "/status"}:
         return radio_status()
@@ -3118,11 +3077,11 @@ def route(method, path, payload):
         return list_profiles()
     if method == "GET" and path in {"/system/health", "/health"}:
         return system_health()
-    if method == "GET" and path in {"/system/metrics", "/dashboard/metrics", "/cgi-bin/pluto-metrics.cgi"}:
+    if method == "GET" and path in {"/system/metrics", "/dashboard/metrics"}:
         return web_metrics()
-    if method == "GET" and path in {"/system/settings", "/dashboard/settings", "/cgi-bin/pluto-settings.cgi"}:
+    if method == "GET" and path in {"/system/settings", "/dashboard/settings"}:
         return web_settings_get()
-    if method == "GET" and path in {"/system/files", "/dashboard/files", "/cgi-bin/pluto-files.cgi"}:
+    if method == "GET" and path in {"/system/files", "/dashboard/files"}:
         return web_files(payload)
     if method == "GET" and path in {"/system/logs", "/logs"}:
         return system_logs(payload)
@@ -3158,7 +3117,7 @@ def route(method, path, payload):
         return apply_profile(payload)
     if method == "POST" and path in {"/radio/tune", "/tune"}:
         return tune(payload)
-    if method == "POST" and path in {"/system/settings", "/dashboard/settings", "/cgi-bin/pluto-settings.cgi"}:
+    if method == "POST" and path in {"/system/settings", "/dashboard/settings"}:
         return web_settings_post(payload)
     if method == "POST" and path in {"/radio/stop", "/stop"}:
         return stop_radio()
@@ -3197,25 +3156,6 @@ def route(method, path, payload):
     if method == "POST" and path in {"/radio/doppler/tick", "/doppler/tick"}:
         return doppler_tick(payload)
     raise ApiError("not_found", "unknown radio API path", status=404, details={"path": path, "method": method})
-
-
-def run_cgi():
-    method = os.environ.get("REQUEST_METHOD", "GET").upper()
-    payload = read_request_body() if method in {"POST", "PUT", "PATCH"} else query_params()
-    path = cgi_path()
-    if method == "GET" and path in {"/radio/audio/live.pcm", "/audio/live.pcm"}:
-        stream_audio("pcm", payload)
-        return
-    if method == "GET" and path in {"/radio/audio/live.wav", "/audio/live.wav"}:
-        stream_audio("wav", payload)
-        return
-    if method == "GET" and path in {"/radio/spectrum/stream", "/spectrum/stream"}:
-        spectrum_stream(payload)
-        return
-    if method == "GET" and path in {"/capture/download"}:
-        download_capture(payload)
-        return
-    json_response(route(method, path, payload))
 
 
 def run_cli(argv):
@@ -3435,22 +3375,17 @@ def run_cli(argv):
 
 def main():
     try:
-        if is_cgi():
-            run_cgi()
-        else:
-            json_response(run_cli(sys.argv))
+        json_response(run_cli(sys.argv))
     except ApiError as exc:
         if exc.code.startswith("audio_"):
             fail_audio_state(exc.code, exc.message)
         fail_state(exc.code, exc.message)
         json_response({"ok": False, "error": exc.code, "message": exc.message, "details": exc.details}, exc.status)
-        if not is_cgi():
-            sys.exit(1 if exc.status >= 400 else exc.status)
+        sys.exit(1 if exc.status >= 400 else exc.status)
     except Exception as exc:
         fail_state("internal_error", str(exc))
         json_response({"ok": False, "error": "internal_error", "message": str(exc)}, 500)
-        if not is_cgi():
-            sys.exit(1)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
