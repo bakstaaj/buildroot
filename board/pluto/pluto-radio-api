@@ -24,6 +24,7 @@ DEFAULT_PROFILE_DIRS = (
 STATE_DIR = Path("/var/run/pluto-radio")
 STATE_FILE = STATE_DIR / "state.json"
 AUDIO_STATE_FILE = STATE_DIR / "audio.json"
+AUDIO_BACKEND_STATUS_FILE = STATE_DIR / "audio-backend-status.json"
 WATCHDOG_STATE_FILE = STATE_DIR / "watchdog.json"
 SPECTRUM_STATE_FILE = STATE_DIR / "spectrum.json"
 DOPPLER_STATE_FILE = STATE_DIR / "doppler.json"
@@ -880,11 +881,46 @@ def audio_request_matches(existing, profile, demod, audio_rate, controls, backen
     return True
 
 
+def load_audio_backend_error(pid):
+    try:
+        report = read_json_file(AUDIO_BACKEND_STATUS_FILE, {})
+    except ApiError:
+        return None
+    if report.get("state") != "error":
+        return None
+    report_pid = report.get("pid")
+    try:
+        if report_pid is not None and pid is not None and int(report_pid) != int(pid):
+            return None
+    except (TypeError, ValueError):
+        return None
+    if not report.get("last_error"):
+        return None
+    return report
+
+
+def clear_audio_backend_status():
+    try:
+        AUDIO_BACKEND_STATUS_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
 def audio_status():
     state = load_audio_state()
     status = state.get("state", "stopped")
     pid = state.get("pid")
-    if status == "running" and not process_alive(pid):
+    backend_error = load_audio_backend_error(pid) if status == "running" else None
+    if backend_error:
+        status = "error"
+        state.update(backend_error)
+        state["state"] = status
+        if not dry_run():
+            save_audio_state(**state)
+            save_state(stream_state="error")
+    elif status == "running" and not process_alive(pid):
         status = "error"
         state["state"] = status
         state["last_error"] = {
@@ -961,12 +997,17 @@ def start_audio(payload):
         AUDIO_FIFO.unlink()
     if not AUDIO_FIFO.exists():
         os.mkfifo(str(AUDIO_FIFO), 0o600)
+    clear_audio_backend_status()
 
+    started_utc = now_utc()
     env = os.environ.copy()
     env.update(
         {
             "PLUTO_AUDIO_FIFO": str(AUDIO_FIFO),
+            "PLUTO_AUDIO_STATE_FILE": str(AUDIO_STATE_FILE),
+            "PLUTO_AUDIO_BACKEND_STATUS_FILE": str(AUDIO_BACKEND_STATUS_FILE),
             "PLUTO_AUDIO_PROFILE": profile["name"],
+            "PLUTO_AUDIO_STARTED_UTC": started_utc,
             "PLUTO_AUDIO_DEMOD": demod,
             "PLUTO_AUDIO_RATE_HZ": str(audio_rate),
             "PLUTO_DSP_INPUT_RATE_HZ": str(profile.get("sample_rate_hz", "")),
@@ -978,6 +1019,9 @@ def start_audio(payload):
             "PLUTO_AUDIO_OUTPUT_GAIN": str(controls["output_gain"]),
             "PLUTO_AUDIO_NOISE_GATE_DB": str(controls["noise_gate_db"]),
             "PLUTO_AUDIO_DC_BLOCK": "1" if controls["dc_block"] else "0",
+            "PLUTO_AUDIO_STREAM_FORMAT": profile.get("stream_format", "pcm_s16le"),
+            "PLUTO_AUDIO_BACKEND_KIND": backend_kind,
+            "PLUTO_AUDIO_BACKEND_PATH": str(backend),
         }
     )
     log_path = STATE_DIR / "audio-backend.log"
@@ -997,7 +1041,7 @@ def start_audio(payload):
         squelch_state="unknown",
         controls=controls,
         restart_count=load_audio_state().get("restart_count", 0),
-        started_utc=now_utc(),
+        started_utc=started_utc,
         stopped_utc=None,
         last_error=None,
     )
@@ -1022,12 +1066,14 @@ def stop_audio():
             except OSError:
                 pass
     stopped = save_audio_state(
+        backend_status_path=str(AUDIO_BACKEND_STATUS_FILE),
         state="stopped",
         stopped_utc=now_utc(),
         pid=None,
         last_error=None,
     )
     save_state(stream_state="idle")
+    clear_audio_backend_status()
     return {"ok": True, "audio": audio_status()["audio"], "state": stopped}
 
 

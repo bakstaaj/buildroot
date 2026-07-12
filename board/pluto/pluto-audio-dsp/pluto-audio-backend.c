@@ -139,6 +139,139 @@ static bool env_bool(const char *name, bool fallback)
     return fallback;
 }
 
+static void json_string(FILE *out, const char *value)
+{
+    fputc('"', out);
+    for (; value && *value; value++) {
+        unsigned char ch = (unsigned char)*value;
+
+        switch (ch) {
+        case '\\':
+            fputs("\\\\", out);
+            break;
+        case '"':
+            fputs("\\\"", out);
+            break;
+        case '\b':
+            fputs("\\b", out);
+            break;
+        case '\f':
+            fputs("\\f", out);
+            break;
+        case '\n':
+            fputs("\\n", out);
+            break;
+        case '\r':
+            fputs("\\r", out);
+            break;
+        case '\t':
+            fputs("\\t", out);
+            break;
+        default:
+            if (ch < 0x20)
+                fprintf(out, "\\u%04x", ch);
+            else
+                fputc(ch, out);
+            break;
+        }
+    }
+    fputc('"', out);
+}
+
+static void json_string_field(FILE *out, const char *key, const char *value, bool comma)
+{
+    fprintf(out, "  \"%s\": ", key);
+    if (value && value[0])
+        json_string(out, value);
+    else
+        fputs("null", out);
+    fputs(comma ? ",\n" : "\n", out);
+}
+
+static void utc_now(char *buf, size_t len)
+{
+    time_t raw = time(NULL);
+    struct tm tm_now;
+
+    if (gmtime_r(&raw, &tm_now))
+        strftime(buf, len, "%Y-%m-%dT%H:%M:%SZ", &tm_now);
+    else
+        snprintf(buf, len, "1970-01-01T00:00:00Z");
+}
+
+static void write_audio_error_file(const char *path, const char *code, const char *message, int errnum)
+{
+    char tmp[512];
+    char now[32];
+    FILE *out;
+    int written;
+
+    if (!path || !path[0])
+        return;
+
+    written = snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
+    if (written <= 0 || (size_t)written >= sizeof(tmp))
+        return;
+
+    out = fopen(tmp, "w");
+    if (!out)
+        return;
+
+    utc_now(now, sizeof(now));
+    fputs("{\n", out);
+    fprintf(out, "  \"audio_rate_hz\": %ld,\n", env_long("PLUTO_AUDIO_RATE_HZ", DEFAULT_AUDIO_RATE, 4000, 48000));
+    json_string_field(out, "backend", env_default("PLUTO_AUDIO_BACKEND_KIND", "external"), true);
+    json_string_field(out, "backend_path", env_default("PLUTO_AUDIO_BACKEND_PATH", "/usr/sbin/pluto-audio-backend"), true);
+    json_string_field(out, "demod_mode", getenv("PLUTO_AUDIO_DEMOD"), true);
+    json_string_field(out, "fifo_path", getenv("PLUTO_AUDIO_FIFO"), true);
+    fprintf(out, "  \"last_error\": {\n");
+    json_string_field(out, "code", code, true);
+    fprintf(out, "    \"errno\": %d,\n", errnum);
+    json_string_field(out, "message", message, true);
+    json_string_field(out, "time_utc", now, false);
+    fprintf(out, "  },\n");
+    fprintf(out, "  \"pid\": %ld,\n", (long)getpid());
+    json_string_field(out, "profile", getenv("PLUTO_AUDIO_PROFILE"), true);
+    fprintf(out, "  \"rms_level\": null,\n");
+    json_string_field(out, "squelch_state", "unknown", true);
+    json_string_field(out, "started_utc", getenv("PLUTO_AUDIO_STARTED_UTC"), true);
+    json_string_field(out, "state", "error", true);
+    json_string_field(out, "stopped_utc", now, true);
+    json_string_field(out, "stream_format", env_default("PLUTO_AUDIO_STREAM_FORMAT", "pcm_s16le"), true);
+    json_string_field(out, "updated_utc", now, false);
+    fputs("}\n", out);
+
+    if (fclose(out) == 0) {
+        if (rename(tmp, path) != 0)
+            unlink(tmp);
+    } else {
+        unlink(tmp);
+    }
+}
+
+static void write_audio_error(const char *code, const char *message, int errnum)
+{
+    write_audio_error_file(env_default("PLUTO_AUDIO_BACKEND_STATUS_FILE", "/var/run/pluto-radio/audio-backend-status.json"), code, message, errnum);
+    write_audio_error_file(env_default("PLUTO_AUDIO_STATE_FILE", "/var/run/pluto-radio/audio.json"), code, message, errnum);
+}
+
+static FILE *open_audio_sink(const char *fifo)
+{
+    for (;;) {
+        FILE *sink;
+
+        errno = 0;
+        sink = fopen(fifo, "wb");
+        if (sink)
+            return sink;
+        if (errno == EINTR && keep_running) {
+            fprintf(stderr, "audio sink open interrupted for %s; retrying\n", fifo);
+            continue;
+        }
+        return NULL;
+    }
+}
+
 static enum demod_mode parse_demod(const char *value)
 {
     if (!value)
@@ -460,14 +593,22 @@ int main(void)
 
     if (!fifo || !fifo[0]) {
         fprintf(stderr, "PLUTO_AUDIO_FIFO is required\n");
+        write_audio_error("audio_fifo_missing", "PLUTO_AUDIO_FIFO is required", 0);
         return 2;
     }
     signal(SIGTERM, handle_signal);
     signal(SIGINT, handle_signal);
+    signal(SIGPIPE, SIG_IGN);
 
-    sink = fopen(fifo, "wb");
+    sink = open_audio_sink(fifo);
     if (!sink) {
-        fprintf(stderr, "could not open audio sink %s: %s\n", fifo, strerror(errno));
+        int errnum = errno;
+        char message[256];
+        if (!keep_running)
+            return 0;
+        snprintf(message, sizeof(message), "could not open audio sink %s: %s", fifo, strerror(errnum));
+        fprintf(stderr, "%s\n", message);
+        write_audio_error("audio_sink_open_failed", message, errnum);
         return 2;
     }
 
@@ -478,6 +619,8 @@ int main(void)
     else
         ret = run_iio(sink, &dsp);
     dsp_destroy(&dsp);
+    if (ret != 0 && keep_running)
+        write_audio_error("audio_backend_stream_failed", "audio backend failed while streaming", errno);
     fclose(sink);
     return ret == 0 ? 0 : 1;
 }
