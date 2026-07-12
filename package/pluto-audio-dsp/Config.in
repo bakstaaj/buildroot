@@ -5,11 +5,12 @@ config BR2_PACKAGE_PLUTO_AUDIO_DSP
 	select BR2_PACKAGE_LIBIIO
 	select BR2_PACKAGE_LIQUID_DSP
 	help
-	  Pluto firmware audio DSP backend.
+	  Pluto firmware audio and spectrum DSP backends.
 
 	  This builds a small C /usr/sbin/pluto-audio-backend executable
 	  around libiio and liquid-dsp so applications can request decoded
-	  PCM audio through the reusable Pluto radio API.
+	  PCM audio through the reusable Pluto radio API. It also installs
+	  /usr/sbin/pluto-spectrum-backend for firmware API spectrum snapshots.
 
 comment "pluto-audio-dsp requires a glibc or musl toolchain w/ dynamic library"
 	depends on !(BR2_TOOLCHAIN_USES_GLIBC || BR2_TOOLCHAIN_USES_MUSL) || BR2_STATIC_LIBS

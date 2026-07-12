@@ -24,6 +24,13 @@ LIQUID_DSP_CONF_ENV = \
 LIQUID_DSP_CFLAGS = $(TARGET_CFLAGS)
 LIQUID_DSP_LDFLAGS = $(TARGET_LDFLAGS)
 
+# Pluto SDR runs on a Cortex-A9 with NEON/VFPv3. Force liquid-dsp to pass
+# explicit CPU/FPU flags so the external toolchain wrapper cannot silently
+# inject stale settings from a previous build environment.
+ifeq ($(BR2_cortex_a9),y)
+LIQUID_DSP_CFLAGS += -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard
+endif
+
 # Speed over accuracy trade off
 ifeq ($(BR2_PACKAGE_LIQUID_DSP_FAST),y)
 LIQUID_DSP_CFLAGS += -ffast-math
@@ -41,6 +48,13 @@ endif
 
 # disable altivec, it has build issues
 ifeq ($(BR2_powerpc)$(BR2_powerpc64)$(BR2_powerpc64le),y)
+LIQUID_DSP_CONF_OPTS += --enable-simdoverride
+endif
+
+# liquid-dsp's ARM autotune path hard-codes Cortex-A7/VFPv4 flags, which are
+# not valid for Pluto's Cortex-A9 target. Use the portable kernels and keep the
+# explicit package CFLAGS above as the only architecture tuning.
+ifeq ($(BR2_arm),y)
 LIQUID_DSP_CONF_OPTS += --enable-simdoverride
 endif
 

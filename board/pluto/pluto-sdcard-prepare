@@ -1,6 +1,7 @@
 #!/bin/sh
 
 destdir=/media
+data_sentinel=".pluto-data-initialized"
 blkid_bin="${BLKID:-/sbin/blkid}"
 fsck_vfat_bin="${FSCK_VFAT:-/sbin/fsck.vfat}"
 e2fsck_bin="${E2FSCK:-/sbin/e2fsck}"
@@ -231,12 +232,24 @@ probe_partitions() {
 	elif command -v partprobe >/dev/null 2>&1; then
 		partprobe "/dev/$disk" 2>/dev/null || true
 	fi
+
+	python3 - "$disk" <<'PY' || true
+import fcntl
+import sys
+
+BLKRRPART = 0x125F
+disk = sys.argv[1]
+
+with open(f"/dev/{disk}", "rb", buffering=0) as handle:
+    fcntl.ioctl(handle.fileno(), BLKRRPART, 0)
+PY
 }
 
 expand_data_partition() {
 	local dev="$1"
 	local disk
 	local disk_sectors
+	local rc
 
 	is_sd_data_part "$dev" || return 0
 	is_mounted "$dev" && return 0
@@ -251,6 +264,7 @@ expand_data_partition() {
 	esac
 
 	python3 - "$disk" "$disk_sectors" <<'PY'
+import os
 import struct
 import sys
 
@@ -278,7 +292,23 @@ with open(mbr_path, "r+b", buffering=0) as handle:
     handle.seek(0)
     handle.write(mbr)
     handle.flush()
+    os.fsync(handle.fileno())
+    raise SystemExit(2)
 PY
+	rc=$?
+	case "$rc" in
+		0)
+			return 0
+			;;
+		2)
+			log "expanded /dev/$dev partition table entry to fill /dev/$disk"
+			;;
+		*)
+			log "failed to expand /dev/$dev partition table entry"
+			return "$rc"
+			;;
+	esac
+
 	probe_partitions "$disk"
 	sleep 1
 	ensure_dev_node "$dev" || return 1
@@ -297,6 +327,25 @@ format_data_partition() {
 		log "mke2fs not available; cannot format /dev/$dev as ext4"
 		return 1
 	fi
+}
+
+data_partition_initialized() {
+	local dev="$1"
+	local mp
+
+	is_sd_data_part "$dev" || return 1
+	mp="$(mount_point "$dev")"
+	[ -f "$mp/$data_sentinel" ]
+}
+
+mark_data_partition_initialized() {
+	local dev="$1"
+	local mp
+
+	is_sd_data_part "$dev" || return 0
+	mp="$(mount_point "$dev")"
+	[ -d "$mp" ] || return 0
+	touch "$mp/$data_sentinel" 2>/dev/null || true
 }
 
 resize_data_fs() {
@@ -376,10 +425,8 @@ prepare_dev() {
 		expand_data_partition "$dev"
 		fstype="$(blkid_fs_type "$dev")"
 		if is_sd_data_part "$dev" && [ -z "$fstype" ]; then
-			format_data_partition "$dev" || return 1
-			fstype="$(blkid_fs_type "$dev")"
-		fi
-		if is_supported_type "$fstype"; then
+			log "/dev/$dev filesystem type is not yet detectable; will try mounting without formatting"
+		elif is_supported_type "$fstype"; then
 			unmount_dev "$dev" || return 1
 			repair_fs "$dev" "$fstype" || return 1
 			if is_sd_data_part "$dev" && is_ext_type "$fstype"; then
@@ -412,7 +459,12 @@ prepare_dev() {
 		return 1
 	fi
 
+	if is_sd_data_part "$dev" && is_ext_type "$(mounted_fs_type "$dev")"; then
+		resize_data_fs "$dev"
+	fi
+
 	log "/dev/$dev mounted at $(mount_point "$dev")"
+	mark_data_partition_initialized "$dev"
 	return 0
 }
 
