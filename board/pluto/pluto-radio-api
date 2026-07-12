@@ -813,6 +813,22 @@ def audio_backend_path(payload):
     return DEFAULT_AUDIO_BACKEND, "external"
 
 
+def audio_request_matches(existing, profile, demod, audio_rate, controls, backend_kind):
+    if existing.get("profile") != profile["name"]:
+        return False
+    if existing.get("demod_mode") != demod:
+        return False
+    if int(existing.get("audio_rate_hz") or 0) != int(audio_rate):
+        return False
+    if existing.get("backend") != backend_kind:
+        return False
+    existing_controls = existing.get("controls") or {}
+    for key, value in controls.items():
+        if existing_controls.get(key) != value:
+            return False
+    return True
+
+
 def audio_status():
     state = load_audio_state()
     status = state.get("state", "stopped")
@@ -852,13 +868,18 @@ def audio_status():
 
 def start_audio(payload):
     existing = audio_status()["audio"]
-    if existing["state"] == "running":
+    if existing["state"] == "running" and not payload:
         return {"ok": True, "audio": existing}
 
     profile = selected_audio_profile(payload)
     demod, audio_rate = audio_capable_profile(profile)
     controls = audio_controls(profile, payload)
     backend, backend_kind = audio_backend_path(payload)
+    if existing["state"] == "running":
+        if audio_request_matches(existing, profile, demod, audio_rate, controls, backend_kind):
+            return {"ok": True, "audio": existing}
+        stop_audio()
+
     if dry_run():
         state = {
             "state": "running",
