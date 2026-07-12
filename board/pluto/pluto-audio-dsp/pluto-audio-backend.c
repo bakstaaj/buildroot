@@ -42,6 +42,7 @@ enum agc_mode {
 };
 
 static volatile sig_atomic_t keep_running = 1;
+static const char *backend_phase = "starting";
 
 struct dsp_state {
     enum demod_mode mode;
@@ -230,6 +231,7 @@ static void write_audio_error_file(const char *path, const char *code, const cha
     json_string_field(out, "backend_path", env_default("PLUTO_AUDIO_BACKEND_PATH", "/usr/sbin/pluto-audio-backend"), true);
     json_string_field(out, "demod_mode", getenv("PLUTO_AUDIO_DEMOD"), true);
     json_string_field(out, "fifo_path", getenv("PLUTO_AUDIO_FIFO"), true);
+    json_string_field(out, "phase", backend_phase, true);
     fprintf(out, "  \"last_error\": {\n");
     json_string_field(out, "code", code, true);
     fprintf(out, "    \"errno\": %d,\n", errnum);
@@ -290,6 +292,7 @@ static void write_audio_running_report(struct dsp_state *dsp)
     json_string_field(out, "fifo_path", getenv("PLUTO_AUDIO_FIFO"), true);
     fprintf(out, "  \"iio_refills\": %u,\n", dsp->iio_refills);
     fprintf(out, "  \"last_error\": null,\n");
+    json_string_field(out, "phase", backend_phase, true);
     fprintf(out, "  \"pcm_bytes\": %" PRIu64 ",\n", dsp->pcm_samples * 2U);
     fprintf(out, "  \"pid\": %ld,\n", (long)getpid());
     json_string_field(out, "profile", getenv("PLUTO_AUDIO_PROFILE"), true);
@@ -595,31 +598,42 @@ static int run_iio(FILE *sink, struct dsp_state *dsp)
     long timeout_ms = env_long("PLUTO_IIO_TIMEOUT_MS", 3000, 100, 30000);
     int ret = 1;
 
+    backend_phase = "iio_context_create";
+    maybe_write_audio_running_report(dsp, true);
     ctx = iio_create_default_context();
     if (!ctx) {
         fprintf(stderr, "could not create IIO context\n");
         goto out;
     }
     iio_context_set_timeout(ctx, (unsigned int)timeout_ms);
+    backend_phase = "iio_find_device";
+    maybe_write_audio_running_report(dsp, true);
     dev = iio_context_find_device(ctx, device_name);
     if (!dev) {
         fprintf(stderr, "could not find IIO device: %s\n", device_name);
         goto out;
     }
+    backend_phase = "iio_find_channels";
+    maybe_write_audio_running_report(dsp, true);
     i_chan = iio_device_find_channel(dev, i_name, false);
     q_chan = iio_device_find_channel(dev, q_name, false);
     if (!i_chan || !q_chan) {
         fprintf(stderr, "could not find IIO channels: %s/%s\n", i_name, q_name);
         goto out;
     }
+    backend_phase = "iio_enable_channels";
+    maybe_write_audio_running_report(dsp, true);
     iio_channel_enable(i_chan);
     iio_channel_enable(q_chan);
+    backend_phase = "iio_create_buffer";
+    maybe_write_audio_running_report(dsp, true);
     buf = iio_device_create_buffer(dev, (size_t)buffer_samples, false);
     if (!buf) {
         fprintf(stderr, "could not create IIO buffer\n");
         goto out;
     }
 
+    backend_phase = "iio_refill_wait";
     maybe_write_audio_running_report(dsp, true);
     while (keep_running) {
         ssize_t refill = iio_buffer_refill(buf);
@@ -627,15 +641,34 @@ static int run_iio(FILE *sink, struct dsp_state *dsp)
             fprintf(stderr, "IIO buffer refill failed: %zd\n", refill);
             goto out;
         }
-        char *ptr = iio_buffer_first(buf, i_chan);
+        if (refill == 0) {
+            fprintf(stderr, "IIO buffer refill returned no bytes\n");
+            goto out;
+        }
+        char *i_ptr = iio_buffer_first(buf, i_chan);
+        char *q_ptr = iio_buffer_first(buf, q_chan);
         char *end = iio_buffer_end(buf);
         ptrdiff_t step = iio_buffer_step(buf);
-        for (; keep_running && ptr < end; ptr += step) {
-            const int16_t *sample = (const int16_t *)ptr;
-            if (dsp_process_iq(dsp, sink, sample[0], sample[1]) < 0)
+        if (!i_ptr || !q_ptr || !end || step <= 0) {
+            fprintf(stderr, "invalid IIO buffer layout: i=%p q=%p end=%p step=%td\n",
+                    (void *)i_ptr, (void *)q_ptr, (void *)end, step);
+            goto out;
+        }
+        backend_phase = "iio_streaming";
+        dsp->iio_refills++;
+        for (; keep_running && i_ptr < end && q_ptr < end; i_ptr += step, q_ptr += step) {
+            int16_t i_sample;
+            int16_t q_sample;
+            memcpy(&i_sample, i_ptr, sizeof(i_sample));
+            memcpy(&q_sample, q_ptr, sizeof(q_sample));
+            if (dsp_process_iq(dsp, sink, i_sample, q_sample) < 0) {
+                fprintf(stderr, "audio sink write failed after %" PRIu64 " PCM bytes: %s\n",
+                        dsp->pcm_samples * 2U, strerror(errno));
                 goto out;
+            }
         }
         fflush(sink);
+        backend_phase = "iio_refill_wait";
         maybe_write_audio_running_report(dsp, true);
     }
     ret = 0;
@@ -677,6 +710,7 @@ int main(void)
     signal(SIGINT, handle_signal);
     signal(SIGPIPE, SIG_IGN);
 
+    backend_phase = "fifo_wait_for_reader";
     sink = open_audio_sink(fifo);
     if (!sink) {
         int errnum = errno;
@@ -689,8 +723,10 @@ int main(void)
         return 2;
     }
 
+    backend_phase = "dsp_init";
     dsp_init(&dsp, mode, input_rate, audio_rate, cw_bfo, filter_width_hz,
              squelch_db, deemphasis, agc, output_gain, noise_gate_db, dc_block);
+    backend_phase = "running";
     if (!strcmp(source, "synthetic"))
         ret = run_synthetic(sink, &dsp, input_rate, test_seconds);
     else
