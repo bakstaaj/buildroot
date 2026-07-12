@@ -881,12 +881,10 @@ def audio_request_matches(existing, profile, demod, audio_rate, controls, backen
     return True
 
 
-def load_audio_backend_error(pid):
+def load_audio_backend_report(pid):
     try:
         report = read_json_file(AUDIO_BACKEND_STATUS_FILE, {})
     except ApiError:
-        return None
-    if report.get("state") != "error":
         return None
     report_pid = report.get("pid")
     try:
@@ -894,9 +892,24 @@ def load_audio_backend_error(pid):
             return None
     except (TypeError, ValueError):
         return None
-    if not report.get("last_error"):
-        return None
-    return report
+    return report or None
+
+
+def merge_audio_backend_report(state, report):
+    if not report:
+        return state
+    for key in (
+        "backend_path",
+        "iio_refills",
+        "last_error",
+        "pcm_bytes",
+        "rms_level",
+        "squelch_state",
+        "updated_utc",
+    ):
+        if key in report:
+            state[key] = report[key]
+    return state
 
 
 def clear_audio_backend_status():
@@ -912,10 +925,10 @@ def audio_status():
     state = load_audio_state()
     status = state.get("state", "stopped")
     pid = state.get("pid")
-    backend_error = load_audio_backend_error(pid) if status == "running" else None
-    if backend_error:
+    backend_report = load_audio_backend_report(pid) if status == "running" else None
+    if backend_report and backend_report.get("state") == "error" and backend_report.get("last_error"):
         status = "error"
-        state.update(backend_error)
+        state.update(backend_report)
         state["state"] = status
         if not dry_run():
             save_audio_state(**state)
@@ -931,6 +944,10 @@ def audio_status():
         if not dry_run():
             save_audio_state(**state)
             save_state(stream_state="error")
+    elif status == "running" and backend_report:
+        state = merge_audio_backend_report(state, backend_report)
+        if not dry_run():
+            save_audio_state(**state)
     return {
         "ok": True,
         "audio": {
@@ -945,6 +962,8 @@ def audio_status():
             "restart_count": state.get("restart_count", 0),
             "rms_level": state.get("rms_level"),
             "squelch_state": state.get("squelch_state", "unknown"),
+            "iio_refills": state.get("iio_refills"),
+            "pcm_bytes": state.get("pcm_bytes"),
             "controls": state.get("controls", {}),
             "started_utc": state.get("started_utc"),
             "stopped_utc": state.get("stopped_utc"),

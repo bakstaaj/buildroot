@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,6 +71,11 @@ struct dsp_state {
     bool noise_gate_enabled;
     float noise_gate_threshold_db;
     float audio_level;
+    uint64_t pcm_samples;
+    double pcm_power_acc;
+    unsigned pcm_power_count;
+    unsigned iio_refills;
+    time_t last_status_time;
     float agc_gain;
     float agc_target;
     float agc_attack;
@@ -253,6 +259,66 @@ static void write_audio_error(const char *code, const char *message, int errnum)
 {
     write_audio_error_file(env_default("PLUTO_AUDIO_BACKEND_STATUS_FILE", "/var/run/pluto-radio/audio-backend-status.json"), code, message, errnum);
     write_audio_error_file(env_default("PLUTO_AUDIO_STATE_FILE", "/var/run/pluto-radio/audio.json"), code, message, errnum);
+}
+
+static void write_audio_running_report(struct dsp_state *dsp)
+{
+    const char *path = env_default("PLUTO_AUDIO_BACKEND_STATUS_FILE", "/var/run/pluto-radio/audio-backend-status.json");
+    char tmp[512];
+    char now[32];
+    FILE *out;
+    int written;
+    float rms = 0.0f;
+
+    if (!path || !path[0])
+        return;
+    if (dsp->pcm_power_count > 0)
+        rms = sqrtf((float)(dsp->pcm_power_acc / (double)dsp->pcm_power_count)) / INT16_CLIP;
+
+    written = snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
+    if (written <= 0 || (size_t)written >= sizeof(tmp))
+        return;
+    out = fopen(tmp, "w");
+    if (!out)
+        return;
+
+    utc_now(now, sizeof(now));
+    fputs("{\n", out);
+    json_string_field(out, "backend", env_default("PLUTO_AUDIO_BACKEND_KIND", "external"), true);
+    json_string_field(out, "backend_path", env_default("PLUTO_AUDIO_BACKEND_PATH", "/usr/sbin/pluto-audio-backend"), true);
+    json_string_field(out, "demod_mode", getenv("PLUTO_AUDIO_DEMOD"), true);
+    json_string_field(out, "fifo_path", getenv("PLUTO_AUDIO_FIFO"), true);
+    fprintf(out, "  \"iio_refills\": %u,\n", dsp->iio_refills);
+    fprintf(out, "  \"last_error\": null,\n");
+    fprintf(out, "  \"pcm_bytes\": %" PRIu64 ",\n", dsp->pcm_samples * 2U);
+    fprintf(out, "  \"pid\": %ld,\n", (long)getpid());
+    json_string_field(out, "profile", getenv("PLUTO_AUDIO_PROFILE"), true);
+    fprintf(out, "  \"rms_level\": %.8g,\n", rms);
+    json_string_field(out, "squelch_state", dsp->squelch_enabled ? (dsp->squelch_open ? "open" : "closed") : "disabled", true);
+    json_string_field(out, "started_utc", getenv("PLUTO_AUDIO_STARTED_UTC"), true);
+    json_string_field(out, "state", "running", true);
+    json_string_field(out, "stream_format", env_default("PLUTO_AUDIO_STREAM_FORMAT", "pcm_s16le"), true);
+    json_string_field(out, "updated_utc", now, false);
+    fputs("}\n", out);
+
+    if (fclose(out) == 0) {
+        if (rename(tmp, path) != 0)
+            unlink(tmp);
+    } else {
+        unlink(tmp);
+    }
+    dsp->pcm_power_acc = 0.0;
+    dsp->pcm_power_count = 0;
+}
+
+static void maybe_write_audio_running_report(struct dsp_state *dsp, bool force)
+{
+    time_t raw = time(NULL);
+
+    if (!force && raw == dsp->last_status_time)
+        return;
+    dsp->last_status_time = raw;
+    write_audio_running_report(dsp);
 }
 
 static FILE *open_audio_sink(const char *fifo)
@@ -453,7 +519,14 @@ static int dsp_emit(struct dsp_state *dsp, FILE *sink, float sample)
     audio *= dsp->output_gain;
     if (dsp->noise_gate_enabled && dbfs(fabsf(audio) / INT16_CLIP) < dsp->noise_gate_threshold_db)
         audio = 0.0f;
-    return write_pcm(sink, clamp_pcm(audio));
+    int16_t pcm = clamp_pcm(audio);
+    if (write_pcm(sink, pcm) < 0)
+        return -1;
+    dsp->pcm_samples++;
+    dsp->pcm_power_acc += (double)pcm * (double)pcm;
+    dsp->pcm_power_count++;
+    maybe_write_audio_running_report(dsp, false);
+    return 0;
 }
 
 static int dsp_process_iq(struct dsp_state *dsp, FILE *sink, int16_t i_raw, int16_t q_raw)
@@ -519,6 +592,7 @@ static int run_iio(FILE *sink, struct dsp_state *dsp)
     struct iio_channel *i_chan = NULL;
     struct iio_channel *q_chan = NULL;
     struct iio_buffer *buf = NULL;
+    long timeout_ms = env_long("PLUTO_IIO_TIMEOUT_MS", 3000, 100, 30000);
     int ret = 1;
 
     ctx = iio_create_default_context();
@@ -526,6 +600,7 @@ static int run_iio(FILE *sink, struct dsp_state *dsp)
         fprintf(stderr, "could not create IIO context\n");
         goto out;
     }
+    iio_context_set_timeout(ctx, (unsigned int)timeout_ms);
     dev = iio_context_find_device(ctx, device_name);
     if (!dev) {
         fprintf(stderr, "could not find IIO device: %s\n", device_name);
@@ -545,6 +620,7 @@ static int run_iio(FILE *sink, struct dsp_state *dsp)
         goto out;
     }
 
+    maybe_write_audio_running_report(dsp, true);
     while (keep_running) {
         ssize_t refill = iio_buffer_refill(buf);
         if (refill < 0) {
@@ -560,6 +636,7 @@ static int run_iio(FILE *sink, struct dsp_state *dsp)
                 goto out;
         }
         fflush(sink);
+        maybe_write_audio_running_report(dsp, true);
     }
     ret = 0;
 
@@ -618,6 +695,7 @@ int main(void)
         ret = run_synthetic(sink, &dsp, input_rate, test_seconds);
     else
         ret = run_iio(sink, &dsp);
+    maybe_write_audio_running_report(&dsp, true);
     dsp_destroy(&dsp);
     if (ret != 0 && keep_running)
         write_audio_error("audio_backend_stream_failed", "audio backend failed while streaming", errno);
