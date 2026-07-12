@@ -60,11 +60,13 @@ DEEMPHASIS_MODES = {"none", "50us", "75us"}
 TX_MODES = {"tone", "carrier", "am", "fm", "cw"}
 TX_AUDIO_SOURCES = {"tone", "file"}
 TX_AUDIO_SAFE_ROOTS = ("/mnt/jffs2/", "/media/", "/tmp/", "/var/run/")
+MIN_AD9361_NO_FIR_SAMPLE_RATE_HZ = 2_083_334
+MAX_AD9361_SAMPLE_RATE_HZ = 61_440_000
 WEB_SETTINGS_SCHEMA = (
     {"key": "rx_lo_hz", "label": "RX LO", "unit": "Hz", "min": "70000000", "max": "6000000000"},
     {"key": "tx_lo_hz", "label": "TX LO", "unit": "Hz", "min": "70000000", "max": "6000000000"},
-    {"key": "rx_sample_rate_hz", "label": "RX sample rate", "unit": "SPS", "min": "520000", "max": "61440000"},
-    {"key": "tx_sample_rate_hz", "label": "TX sample rate", "unit": "SPS", "min": "520000", "max": "61440000"},
+    {"key": "rx_sample_rate_hz", "label": "RX sample rate", "unit": "SPS", "min": str(MIN_AD9361_NO_FIR_SAMPLE_RATE_HZ), "max": str(MAX_AD9361_SAMPLE_RATE_HZ)},
+    {"key": "tx_sample_rate_hz", "label": "TX sample rate", "unit": "SPS", "min": str(MIN_AD9361_NO_FIR_SAMPLE_RATE_HZ), "max": str(MAX_AD9361_SAMPLE_RATE_HZ)},
     {"key": "rx_rf_bandwidth_hz", "label": "RX RF bandwidth", "unit": "Hz", "min": "200000", "max": "56000000"},
     {"key": "tx_rf_bandwidth_hz", "label": "TX RF bandwidth", "unit": "Hz", "min": "200000", "max": "56000000"},
     {"key": "rx_gain_control_mode", "label": "RX gain mode", "unit": "manual|slow_attack|fast_attack|hybrid"},
@@ -437,7 +439,7 @@ def clean_profile(profile, source):
         cleaned.get("default_frequency_hz"), "default_frequency_hz", 70_000_000, 6_000_000_000
     )
     cleaned["sample_rate_hz"] = validate_uint(
-        cleaned.get("sample_rate_hz"), "sample_rate_hz", 520_000, 61_440_000
+        cleaned.get("sample_rate_hz"), "sample_rate_hz", MIN_AD9361_NO_FIR_SAMPLE_RATE_HZ, MAX_AD9361_SAMPLE_RATE_HZ
     )
     cleaned["rf_bandwidth_hz"] = validate_uint(
         cleaned.get("rf_bandwidth_hz"), "rf_bandwidth_hz", 200_000, 56_000_000
@@ -576,6 +578,54 @@ def read_attr(device, attr):
         return None
 
 
+def parse_iio_available_range(raw):
+    if not raw:
+        return None
+    cleaned = raw.replace("[", " ").replace("]", " ").replace(",", " ")
+    values = []
+    for token in cleaned.split():
+        try:
+            values.append(int(float(token)))
+        except ValueError:
+            continue
+    if len(values) < 3:
+        return None
+    return {"min": values[0], "step": max(values[1], 1), "max": values[2], "raw": raw}
+
+
+def sample_rate_available(device, direction):
+    attr = f"{direction}_voltage_sampling_frequency_available"
+    parsed = parse_iio_available_range(read_attr(device, attr))
+    if parsed:
+        # The no-FIR driver path advertises floor(MIN_ADC_CLK / 12), but the
+        # clock-chain calculation needs the ceiling value to avoid "below limit".
+        if parsed["min"] == MIN_AD9361_NO_FIR_SAMPLE_RATE_HZ - 1:
+            parsed["min"] = MIN_AD9361_NO_FIR_SAMPLE_RATE_HZ
+        return parsed
+    return {
+        "min": MIN_AD9361_NO_FIR_SAMPLE_RATE_HZ,
+        "step": 1,
+        "max": MAX_AD9361_SAMPLE_RATE_HZ,
+        "raw": None,
+    }
+
+
+def validate_device_sample_rate(device, direction, rate):
+    available = sample_rate_available(device, direction)
+    if rate < available["min"] or rate > available["max"] or ((rate - available["min"]) % available["step"]) != 0:
+        raise ApiError(
+            "invalid_sample_rate",
+            f"{direction.upper()} sample_rate_hz is not supported by the current AD9361 clock path",
+            status=400,
+            details={
+                "sample_rate_hz": rate,
+                "available": available,
+                "direction": direction,
+            },
+        )
+    return rate
+
+
 def write_attr(device, attr, value, required=False):
     if dry_run():
         return {"attr": attr, "value": str(value), "status": "dry_run"}
@@ -628,10 +678,11 @@ def apply_profile(payload):
         raise ApiError("invalid_value", "gain_control_mode is invalid", details={"gain_control_mode": gain_mode})
 
     device = find_iio_device()
+    sample_rate_hz = validate_device_sample_rate(device, "in", profile["sample_rate_hz"])
     writes = [
         write_attr(device, "out_altvoltage0_RX_LO_frequency", frequency, required=True),
         write_attr(device, "in_voltage_rf_bandwidth", profile["rf_bandwidth_hz"], required=True),
-        write_attr(device, "in_voltage_sampling_frequency", profile["sample_rate_hz"]),
+        write_attr(device, "in_voltage_sampling_frequency", sample_rate_hz, required=True),
         write_attr(device, "in_voltage0_gain_control_mode", gain_mode, required=True),
         write_attr(device, "in_voltage1_gain_control_mode", gain_mode),
     ]
@@ -1609,8 +1660,8 @@ def validate_loopback(payload):
     sample_rate_hz = validate_uint(
         payload.get("sample_rate_hz", profile["sample_rate_hz"]),
         "sample_rate_hz",
-        520_000,
-        61_440_000,
+        MIN_AD9361_NO_FIR_SAMPLE_RATE_HZ,
+        MAX_AD9361_SAMPLE_RATE_HZ,
     )
     if tx_tone_hz >= sample_rate_hz // 4:
         raise ApiError(
@@ -1642,10 +1693,11 @@ def apply_loopback_config(plan):
         }
     )
     device = find_iio_device()
+    sample_rate_hz = validate_device_sample_rate(device, "out", plan["sample_rate_hz"])
     writes = [
         write_attr(device, "out_altvoltage1_TX_LO_frequency", plan["frequency_hz"], required=True),
         write_attr(device, "out_voltage_rf_bandwidth", plan["rf_bandwidth_hz"], required=True),
-        write_attr(device, "out_voltage_sampling_frequency", plan["sample_rate_hz"], required=True),
+        write_attr(device, "out_voltage_sampling_frequency", sample_rate_hz, required=True),
         write_attr(device, "out_voltage0_hardwaregain", plan["tx_gain_db"], required=True),
         write_attr(device, "out_voltage1_hardwaregain", plan["tx_gain_db"]),
         write_attr(device, "ensm_mode", "fdd"),
@@ -1844,8 +1896,8 @@ def validate_tx(payload):
     sample_rate_hz = validate_uint(
         payload.get("sample_rate_hz", profile["sample_rate_hz"]),
         "sample_rate_hz",
-        520_000,
-        61_440_000,
+        MIN_AD9361_NO_FIR_SAMPLE_RATE_HZ,
+        MAX_AD9361_SAMPLE_RATE_HZ,
         )
     if tx_tone_hz and tx_tone_hz >= sample_rate_hz // 4:
         raise ApiError(
@@ -1886,7 +1938,7 @@ def validate_tx(payload):
 def tx_guardrail_bounds():
     return {
         "frequency_hz": {"min": 70_000_000, "max": 6_000_000_000},
-        "sample_rate_hz": {"min": 520_000, "max": 61_440_000},
+        "sample_rate_hz": {"min": MIN_AD9361_NO_FIR_SAMPLE_RATE_HZ, "max": MAX_AD9361_SAMPLE_RATE_HZ},
         "rf_bandwidth_hz": {"min": 200_000, "max": 56_000_000},
         "tx_gain_db": {"min": -89.75, "max": 0.0},
         "tx_amplitude": {"min": 0.0, "max": TX_MAX_TX_AMPLITUDE},
@@ -2048,10 +2100,11 @@ def apply_tx_config(plan):
         }
     )
     device = find_iio_device()
+    sample_rate_hz = validate_device_sample_rate(device, "out", plan["sample_rate_hz"])
     writes = [
         write_attr(device, "out_altvoltage1_TX_LO_frequency", plan["frequency_hz"], required=True),
         write_attr(device, "out_voltage_rf_bandwidth", plan["rf_bandwidth_hz"], required=True),
-        write_attr(device, "out_voltage_sampling_frequency", plan["sample_rate_hz"], required=True),
+        write_attr(device, "out_voltage_sampling_frequency", sample_rate_hz, required=True),
         write_attr(device, "out_voltage0_hardwaregain", plan["tx_gain_db"], required=True),
         write_attr(device, "out_voltage1_hardwaregain", plan["tx_gain_db"]),
         write_attr(device, "ensm_mode", "fdd"),
@@ -2705,7 +2758,7 @@ def web_setting_valid(key, value):
         if key in {"rx_lo_hz", "tx_lo_hz"}:
             validate_uint(value, key, 70_000_000, 6_000_000_000)
         elif key in {"rx_sample_rate_hz", "tx_sample_rate_hz"}:
-            validate_uint(value, key, 520_000, 61_440_000)
+            validate_uint(value, key, MIN_AD9361_NO_FIR_SAMPLE_RATE_HZ, MAX_AD9361_SAMPLE_RATE_HZ)
         elif key in {"rx_rf_bandwidth_hz", "tx_rf_bandwidth_hz"}:
             validate_uint(value, key, 200_000, 56_000_000)
         elif key == "rx_gain_control_mode":

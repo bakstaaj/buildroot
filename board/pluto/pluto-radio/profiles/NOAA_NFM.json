@@ -3,7 +3,7 @@
   "label": "NOAA weather narrowband FM",
   "description": "NOAA weather radio diagnostic profile.",
   "default_frequency_hz": 162550000,
-  "sample_rate_hz": 1000000,
+  "sample_rate_hz": 2400000,
   "rf_bandwidth_hz": 200000,
   "gain_control_mode": "manual",
   "gain_db": 40,

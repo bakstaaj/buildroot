@@ -3,7 +3,7 @@
   "label": "Satellite CW monitor",
   "description": "CW carrier monitoring with a browser-friendly audio tone target.",
   "default_frequency_hz": 145800000,
-  "sample_rate_hz": 600000,
+  "sample_rate_hz": 2400000,
   "rf_bandwidth_hz": 200000,
   "gain_control_mode": "manual",
   "gain_db": 40,
