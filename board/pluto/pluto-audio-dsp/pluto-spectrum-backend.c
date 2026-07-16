@@ -99,6 +99,18 @@ static double dbfs(double power)
     return 10.0 * log10(power);
 }
 
+static int16_t unpack_ad9361_s12_sample(const void *ptr)
+{
+    uint16_t raw;
+    int32_t value;
+
+    memcpy(&raw, ptr, sizeof(raw));
+    value = (int32_t)(raw & 0x0fff);
+    if (value & 0x0800)
+        value -= 0x1000;
+    return (int16_t)(value << 4);
+}
+
 static long long now_epoch_ms(void)
 {
     struct timespec ts;
@@ -274,9 +286,8 @@ static int refill_iq(struct capture_context *cap, int16_t *iq)
         end = iio_buffer_end(cap->buf);
         step = iio_buffer_step(cap->buf);
         for (; ptr < end && copied < cap->samples; ptr += step) {
-            const int16_t *sample = (const int16_t *)ptr;
-            iq[copied * 2] = sample[0];
-            iq[copied * 2 + 1] = sample[1];
+            iq[copied * 2] = unpack_ad9361_s12_sample(ptr);
+            iq[copied * 2 + 1] = unpack_ad9361_s12_sample(ptr + sizeof(uint16_t));
             copied++;
         }
     }

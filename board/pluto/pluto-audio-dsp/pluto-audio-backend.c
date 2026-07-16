@@ -41,14 +41,31 @@ enum agc_mode {
     AGC_FAST,
 };
 
+enum iq_mode {
+    IQ_NORMAL,
+    IQ_SWAP,
+    IQ_INVERT_I,
+    IQ_INVERT_Q,
+    IQ_INVERT_BOTH,
+    IQ_SWAP_INVERT_I,
+    IQ_SWAP_INVERT_Q,
+    IQ_SWAP_INVERT_BOTH,
+};
+
 static volatile sig_atomic_t keep_running = 1;
 static const char *backend_phase = "starting";
+
+static const char *iq_mode_name(enum iq_mode mode);
 
 struct dsp_state {
     enum demod_mode mode;
     enum agc_mode agc;
-    freqdem fm;
-    unsigned decim;
+    enum iq_mode iq_mode;
+    unsigned iq_decim;
+    unsigned iq_count;
+    unsigned output_rate_acc;
+    unsigned audio_rate;
+    unsigned processing_rate;
     unsigned count;
     unsigned squelch_hold;
     unsigned squelch_hang;
@@ -65,6 +82,22 @@ struct dsp_state {
     bool squelch_open;
     bool dc_block;
     float dc;
+    float iq_shift_step;
+    float iq_shift_cos;
+    float iq_shift_sin;
+    float iq_shift_step_cos;
+    float iq_shift_step_sin;
+    unsigned iq_shift_renorm;
+    bool fm_channel_filter_enabled;
+    float fm_channel_alpha;
+    float fm_channel_i;
+    float fm_channel_q;
+    bool fm_channel_ready;
+    bool fm_limiter_enabled;
+    float fm_limiter_floor;
+    float prev_i;
+    float prev_q;
+    bool have_prev_iq;
     bool deemphasis_enabled;
     float deemphasis_alpha;
     float deemphasis_lp;
@@ -73,20 +106,37 @@ struct dsp_state {
     float noise_gate_threshold_db;
     float audio_level;
     uint64_t pcm_samples;
+    uint64_t last_report_pcm_samples;
     double pcm_power_acc;
+    double pcm_measured_rate_hz;
     unsigned pcm_power_count;
     unsigned iio_refills;
     time_t last_status_time;
+    double last_report_monotonic;
     float agc_gain;
     float agc_target;
     float agc_attack;
     float agc_release;
+    int64_t i_acc;
+    int64_t q_acc;
 };
 
 static void handle_signal(int signo)
 {
     (void)signo;
     keep_running = 0;
+}
+
+static int16_t unpack_ad9361_s12_sample(const void *ptr)
+{
+    uint16_t raw;
+    int32_t value;
+
+    memcpy(&raw, ptr, sizeof(raw));
+    value = (int32_t)(raw & 0x0fff);
+    if (value & 0x0800)
+        value -= 0x1000;
+    return (int16_t)(value << 4);
 }
 
 static const char *env_default(const char *name, const char *fallback)
@@ -263,6 +313,15 @@ static void write_audio_error(const char *code, const char *message, int errnum)
     write_audio_error_file(env_default("PLUTO_AUDIO_STATE_FILE", "/var/run/pluto-radio/audio.json"), code, message, errnum);
 }
 
+static double monotonic_seconds(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0.0;
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
 static void write_audio_running_report(struct dsp_state *dsp)
 {
     const char *path = env_default("PLUTO_AUDIO_BACKEND_STATUS_FILE", "/var/run/pluto-radio/audio-backend-status.json");
@@ -271,11 +330,24 @@ static void write_audio_running_report(struct dsp_state *dsp)
     FILE *out;
     int written;
     float rms = 0.0f;
+    double raw;
+    double elapsed;
 
     if (!path || !path[0])
         return;
     if (dsp->pcm_power_count > 0)
         rms = sqrtf((float)(dsp->pcm_power_acc / (double)dsp->pcm_power_count)) / INT16_CLIP;
+    raw = monotonic_seconds();
+    elapsed = raw - dsp->last_report_monotonic;
+    if (dsp->last_report_monotonic > 0.0 && elapsed >= 0.25) {
+        dsp->pcm_measured_rate_hz = (double)(dsp->pcm_samples - dsp->last_report_pcm_samples) /
+            elapsed;
+        dsp->last_report_pcm_samples = dsp->pcm_samples;
+        dsp->last_report_monotonic = raw;
+    } else if (dsp->last_report_monotonic <= 0.0) {
+        dsp->last_report_pcm_samples = dsp->pcm_samples;
+        dsp->last_report_monotonic = raw;
+    }
 
     written = snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
     if (written <= 0 || (size_t)written >= sizeof(tmp))
@@ -291,11 +363,21 @@ static void write_audio_running_report(struct dsp_state *dsp)
     json_string_field(out, "demod_mode", getenv("PLUTO_AUDIO_DEMOD"), true);
     json_string_field(out, "fifo_path", getenv("PLUTO_AUDIO_FIFO"), true);
     fprintf(out, "  \"iio_refills\": %u,\n", dsp->iio_refills);
+    fprintf(out, "  \"input_sample_rate_hz\": %ld,\n", env_long("PLUTO_DSP_INPUT_RATE_HZ", DEFAULT_IN_RATE, 4000, 5000000));
+    fprintf(out, "  \"frequency_shift_hz\": %ld,\n", env_long("PLUTO_DSP_FREQUENCY_SHIFT_HZ", 0, -2500000, 2500000));
+    fprintf(out, "  \"fm_channel_filter\": %s,\n", dsp->fm_channel_filter_enabled ? "true" : "false");
+    fprintf(out, "  \"fm_limiter\": %s,\n", dsp->fm_limiter_enabled ? "true" : "false");
+    json_string_field(out, "iq_mode", iq_mode_name(dsp->iq_mode), true);
+    fprintf(out, "  \"iq_decimation\": %u,\n", dsp->iq_decim);
     fprintf(out, "  \"last_error\": null,\n");
     json_string_field(out, "phase", backend_phase, true);
     fprintf(out, "  \"pcm_bytes\": %" PRIu64 ",\n", dsp->pcm_samples * 2U);
+    fprintf(out, "  \"pcm_rate_hz\": %u,\n", dsp->audio_rate);
+    fprintf(out, "  \"pcm_measured_rate_hz\": %.3f,\n", dsp->pcm_measured_rate_hz);
     fprintf(out, "  \"pid\": %ld,\n", (long)getpid());
     json_string_field(out, "profile", getenv("PLUTO_AUDIO_PROFILE"), true);
+    fprintf(out, "  \"processing_sample_rate_hz\": %ld,\n",
+            env_long("PLUTO_DSP_INPUT_RATE_HZ", DEFAULT_IN_RATE, 4000, 5000000) / (long)dsp->iq_decim);
     fprintf(out, "  \"rms_level\": %.8g,\n", rms);
     json_string_field(out, "squelch_state", dsp->squelch_enabled ? (dsp->squelch_open ? "open" : "closed") : "disabled", true);
     json_string_field(out, "started_utc", getenv("PLUTO_AUDIO_STARTED_UTC"), true);
@@ -324,8 +406,11 @@ static void maybe_write_audio_running_report(struct dsp_state *dsp, bool force)
     write_audio_running_report(dsp);
 }
 
-static FILE *open_audio_sink(const char *fifo)
+static FILE *open_audio_sink(const char *fifo, bool regular_file)
 {
+    if (regular_file)
+        return fopen(fifo, "wb");
+
     for (;;) {
         FILE *sink;
 
@@ -363,6 +448,50 @@ static enum agc_mode parse_agc(const char *value)
     if (!strcmp(value, "slow_attack") || !strcmp(value, "normalize"))
         return AGC_SLOW;
     return AGC_OFF;
+}
+
+static enum iq_mode parse_iq_mode(const char *value)
+{
+    if (!value || !value[0] || !strcmp(value, "normal"))
+        return IQ_NORMAL;
+    if (!strcmp(value, "swap"))
+        return IQ_SWAP;
+    if (!strcmp(value, "invert_i"))
+        return IQ_INVERT_I;
+    if (!strcmp(value, "invert_q") || !strcmp(value, "conjugate"))
+        return IQ_INVERT_Q;
+    if (!strcmp(value, "invert_both"))
+        return IQ_INVERT_BOTH;
+    if (!strcmp(value, "swap_invert_i"))
+        return IQ_SWAP_INVERT_I;
+    if (!strcmp(value, "swap_invert_q"))
+        return IQ_SWAP_INVERT_Q;
+    if (!strcmp(value, "swap_invert_both"))
+        return IQ_SWAP_INVERT_BOTH;
+    return IQ_NORMAL;
+}
+
+static const char *iq_mode_name(enum iq_mode mode)
+{
+    switch (mode) {
+    case IQ_SWAP:
+        return "swap";
+    case IQ_INVERT_I:
+        return "invert_i";
+    case IQ_INVERT_Q:
+        return "invert_q";
+    case IQ_INVERT_BOTH:
+        return "invert_both";
+    case IQ_SWAP_INVERT_I:
+        return "swap_invert_i";
+    case IQ_SWAP_INVERT_Q:
+        return "swap_invert_q";
+    case IQ_SWAP_INVERT_BOTH:
+        return "swap_invert_both";
+    case IQ_NORMAL:
+    default:
+        return "normal";
+    }
 }
 
 static float deemphasis_tau(const char *value)
@@ -418,25 +547,63 @@ static int write_pcm(FILE *sink, int16_t sample)
 static void dsp_init(struct dsp_state *dsp, enum demod_mode mode, long input_rate,
                      long audio_rate, long cw_bfo, long filter_width_hz,
                      float squelch_db, const char *deemphasis, enum agc_mode agc,
-                     float output_gain, float noise_gate_db, bool dc_block)
+                     long frequency_shift_hz, float output_gain, float noise_gate_db,
+                     bool dc_block, enum iq_mode iq_mode, bool fm_limiter_enabled,
+                     bool fm_channel_filter_enabled)
 {
     float tau = deemphasis_tau(deemphasis);
     float filter_cutoff = (float)filter_width_hz * 0.5f;
+    long processing_rate;
+    long minimum_processing_rate = audio_rate * 4;
+
+    /*
+     * The AD9361 runs the NOAA and satellite profiles at 2.4 MS/s, but
+     * demodulating every raw IQ sample costs enough CPU to fall behind the
+     * DMA stream.  Keep enough complex-sample bandwidth for the requested
+     * audio filter, then do the expensive demodulation at that lower rate.
+     */
+    if (filter_width_hz > 0 && filter_width_hz * 3 > minimum_processing_rate)
+        minimum_processing_rate = filter_width_hz * 3;
+    if (mode == DEMOD_WFM && minimum_processing_rate < 480000)
+        minimum_processing_rate = 480000;
 
     memset(dsp, 0, sizeof(*dsp));
     dsp->mode = mode;
     dsp->agc = agc;
-    dsp->decim = (unsigned)lroundf((float)input_rate / (float)audio_rate);
-    if (dsp->decim < 1)
-        dsp->decim = 1;
+    dsp->iq_mode = iq_mode;
+    dsp->iq_decim = (unsigned)(input_rate / minimum_processing_rate);
+    /*
+     * FM must discriminate consecutive complex samples before audio-rate
+     * decimation. Averaging I/Q first smears the instantaneous phase delta and
+     * turns weak NFM voice into static even when the RF samples are valid.
+     */
+    if (mode == DEMOD_NFM || mode == DEMOD_WFM)
+        dsp->iq_decim = 1;
+    if (dsp->iq_decim < 1)
+        dsp->iq_decim = 1;
+    processing_rate = input_rate / (long)dsp->iq_decim;
+    dsp->audio_rate = (unsigned)audio_rate;
+    dsp->processing_rate = (unsigned)processing_rate;
+    dsp->iq_shift_step = -2.0f * (float)M_PI * (float)frequency_shift_hz / (float)processing_rate;
+    dsp->iq_shift_cos = 1.0f;
+    dsp->iq_shift_sin = 0.0f;
+    dsp->iq_shift_step_cos = cosf(dsp->iq_shift_step);
+    dsp->iq_shift_step_sin = sinf(dsp->iq_shift_step);
+    dsp->fm_limiter_enabled = fm_limiter_enabled;
+    dsp->fm_channel_filter_enabled = fm_channel_filter_enabled &&
+        (mode == DEMOD_NFM || mode == DEMOD_WFM) && filter_cutoff > 0.0f;
+    dsp->fm_channel_alpha = dsp->fm_channel_filter_enabled
+        ? one_pole_alpha(filter_cutoff, (float)processing_rate)
+        : 1.0f;
+    dsp->fm_limiter_floor = 1.0e-5f;
     dsp->am_avg = 0.01f;
     dsp->cw_step = 2.0f * (float)M_PI * (float)cw_bfo / (float)audio_rate;
     dsp->squelch_threshold_db = squelch_db;
     dsp->squelch_enabled = squelch_db > -119.0f;
     dsp->squelch_open = !dsp->squelch_enabled;
-    dsp->squelch_hang = (unsigned)((float)input_rate * 0.18f);
-    if (dsp->squelch_hang < dsp->decim)
-        dsp->squelch_hang = dsp->decim;
+    dsp->squelch_hang = (unsigned)((float)processing_rate * 0.18f);
+    if (dsp->squelch_hang < 1)
+        dsp->squelch_hang = 1;
     dsp->dc_block = dc_block;
     dsp->deemphasis_enabled = tau > 0.0f;
     dsp->deemphasis_alpha = dsp->deemphasis_enabled
@@ -451,11 +618,9 @@ static void dsp_init(struct dsp_state *dsp, enum demod_mode mode, long input_rat
     dsp->agc_release = agc == AGC_FAST ? 0.004f : 0.001f;
 
     if (mode == DEMOD_WFM) {
-        dsp->fm = freqdem_create(0.08f);
         dsp->scale = 15500.0f;
         dsp->alpha = 0.18f;
     } else if (mode == DEMOD_NFM) {
-        dsp->fm = freqdem_create(0.42f);
         dsp->scale = 10500.0f;
         dsp->alpha = 0.12f;
     } else if (mode == DEMOD_CW) {
@@ -466,13 +631,12 @@ static void dsp_init(struct dsp_state *dsp, enum demod_mode mode, long input_rat
         dsp->alpha = 0.06f;
     }
     if (filter_cutoff > 0.0f)
-        dsp->alpha = one_pole_alpha(filter_cutoff, (float)input_rate);
+        dsp->alpha = one_pole_alpha(filter_cutoff, (float)processing_rate);
 }
 
 static void dsp_destroy(struct dsp_state *dsp)
 {
-    if (dsp->fm)
-        freqdem_destroy(dsp->fm);
+    (void)dsp;
 }
 
 static int dsp_emit(struct dsp_state *dsp, FILE *sink, float sample)
@@ -480,8 +644,11 @@ static int dsp_emit(struct dsp_state *dsp, FILE *sink, float sample)
     dsp->lp += (sample - dsp->lp) * dsp->alpha;
     dsp->acc += dsp->lp;
     dsp->count++;
-    if (dsp->count < dsp->decim)
+    dsp->output_rate_acc += dsp->audio_rate;
+    if (dsp->output_rate_acc < dsp->processing_rate)
         return 0;
+
+    dsp->output_rate_acc -= dsp->processing_rate;
 
     float audio = dsp->acc / (float)dsp->count;
     dsp->acc = 0.0f;
@@ -536,8 +703,94 @@ static int dsp_process_iq(struct dsp_state *dsp, FILE *sink, int16_t i_raw, int1
 {
     float i_val = (float)i_raw / 32768.0f;
     float q_val = (float)q_raw / 32768.0f;
-    float mag = sqrtf(i_val * i_val + q_val * q_val);
+    float mag;
     float sample = 0.0f;
+
+    switch (dsp->iq_mode) {
+    case IQ_SWAP: {
+        float tmp = i_val;
+        i_val = q_val;
+        q_val = tmp;
+        break;
+    }
+    case IQ_INVERT_I:
+        i_val = -i_val;
+        break;
+    case IQ_INVERT_Q:
+        q_val = -q_val;
+        break;
+    case IQ_INVERT_BOTH:
+        i_val = -i_val;
+        q_val = -q_val;
+        break;
+    case IQ_SWAP_INVERT_I: {
+        float tmp = i_val;
+        i_val = -q_val;
+        q_val = tmp;
+        break;
+    }
+    case IQ_SWAP_INVERT_Q: {
+        float tmp = i_val;
+        i_val = q_val;
+        q_val = -tmp;
+        break;
+    }
+    case IQ_SWAP_INVERT_BOTH: {
+        float tmp = i_val;
+        i_val = -q_val;
+        q_val = -tmp;
+        break;
+    }
+    case IQ_NORMAL:
+    default:
+        break;
+    }
+
+    if (dsp->iq_shift_step != 0.0f) {
+        float c = dsp->iq_shift_cos;
+        float s = dsp->iq_shift_sin;
+        float mixed_i = i_val * c - q_val * s;
+        float mixed_q = i_val * s + q_val * c;
+        float next_c = c * dsp->iq_shift_step_cos - s * dsp->iq_shift_step_sin;
+        float next_s = s * dsp->iq_shift_step_cos + c * dsp->iq_shift_step_sin;
+        i_val = mixed_i;
+        q_val = mixed_q;
+        dsp->iq_shift_cos = next_c;
+        dsp->iq_shift_sin = next_s;
+        dsp->iq_shift_renorm++;
+        if (dsp->iq_shift_renorm >= 4096U) {
+            float norm = sqrtf(dsp->iq_shift_cos * dsp->iq_shift_cos +
+                               dsp->iq_shift_sin * dsp->iq_shift_sin);
+            if (norm > 0.0f) {
+                dsp->iq_shift_cos /= norm;
+                dsp->iq_shift_sin /= norm;
+            }
+            dsp->iq_shift_renorm = 0;
+        }
+    }
+
+    if ((dsp->mode == DEMOD_NFM || dsp->mode == DEMOD_WFM) && dsp->fm_channel_filter_enabled) {
+        if (!dsp->fm_channel_ready) {
+            dsp->fm_channel_i = i_val;
+            dsp->fm_channel_q = q_val;
+            dsp->fm_channel_ready = true;
+        } else {
+            dsp->fm_channel_i += (i_val - dsp->fm_channel_i) * dsp->fm_channel_alpha;
+            dsp->fm_channel_q += (q_val - dsp->fm_channel_q) * dsp->fm_channel_alpha;
+        }
+        i_val = dsp->fm_channel_i;
+        q_val = dsp->fm_channel_q;
+    }
+
+    mag = sqrtf(i_val * i_val + q_val * q_val);
+    if ((dsp->mode == DEMOD_NFM || dsp->mode == DEMOD_WFM) && dsp->fm_limiter_enabled) {
+        float limit_mag = mag;
+        if (limit_mag < dsp->fm_limiter_floor)
+            limit_mag = dsp->fm_limiter_floor;
+        i_val /= limit_mag;
+        q_val /= limit_mag;
+        mag = 1.0f;
+    }
 
     dsp->signal_level += (mag - dsp->signal_level) * 0.0015f;
     if (dsp->squelch_enabled) {
@@ -553,8 +806,14 @@ static int dsp_process_iq(struct dsp_state *dsp, FILE *sink, int16_t i_raw, int1
     }
 
     if (dsp->mode == DEMOD_NFM || dsp->mode == DEMOD_WFM) {
-        liquid_float_complex x = i_val + q_val * _Complex_I;
-        freqdem_demodulate(dsp->fm, x, &sample);
+        if (dsp->have_prev_iq) {
+            float cross = dsp->prev_i * q_val - dsp->prev_q * i_val;
+            float dot = dsp->prev_i * i_val + dsp->prev_q * q_val;
+            sample = atan2f(cross, dot);
+        }
+        dsp->prev_i = i_val;
+        dsp->prev_q = q_val;
+        dsp->have_prev_iq = true;
         sample *= dsp->scale;
     } else {
         dsp->am_avg += (mag - dsp->am_avg) * 0.0015f;
@@ -566,6 +825,25 @@ static int dsp_process_iq(struct dsp_state *dsp, FILE *sink, int16_t i_raw, int1
     return dsp_emit(dsp, sink, sample);
 }
 
+static int dsp_push_iq(struct dsp_state *dsp, FILE *sink, int16_t i_raw, int16_t q_raw)
+{
+    int16_t i_average;
+    int16_t q_average;
+
+    dsp->i_acc += i_raw;
+    dsp->q_acc += q_raw;
+    dsp->iq_count++;
+    if (dsp->iq_count < dsp->iq_decim)
+        return 0;
+
+    i_average = (int16_t)(dsp->i_acc / (int64_t)dsp->iq_count);
+    q_average = (int16_t)(dsp->q_acc / (int64_t)dsp->iq_count);
+    dsp->i_acc = 0;
+    dsp->q_acc = 0;
+    dsp->iq_count = 0;
+    return dsp_process_iq(dsp, sink, i_average, q_average);
+}
+
 static int run_synthetic(FILE *sink, struct dsp_state *dsp, long input_rate, long seconds)
 {
     long total = seconds > 0 ? input_rate * seconds : input_rate;
@@ -575,12 +853,104 @@ static int run_synthetic(FILE *sink, struct dsp_state *dsp, long input_rate, lon
     for (long n = 0; keep_running && n < total; n++) {
         int16_t i_val = (int16_t)(cosf(phase) * 18000.0f);
         int16_t q_val = (int16_t)(sinf(phase) * 18000.0f);
-        if (dsp_process_iq(dsp, sink, i_val, q_val) < 0)
+        if (dsp_push_iq(dsp, sink, i_val, q_val) < 0)
             return -1;
         phase += step;
         if (phase > (float)M_PI)
             phase -= 2.0f * (float)M_PI;
     }
+    return 0;
+}
+
+static int run_synthetic_fm(FILE *sink, struct dsp_state *dsp, long input_rate, long seconds)
+{
+    long processing_rate = (long)dsp->processing_rate;
+    long total;
+    long audio_tone_hz = env_long("PLUTO_AUDIO_SYNTHETIC_TONE_HZ", 1000, 20, 3000);
+    long fm_deviation_hz = env_long("PLUTO_AUDIO_SYNTHETIC_FM_DEVIATION_HZ", 5000, 100, 25000);
+    long carrier_hz = env_long("PLUTO_AUDIO_SYNTHETIC_CARRIER_HZ", 0, -input_rate / 2, input_rate / 2);
+    float phase = 0.0f;
+    float audio_phase = 0.0f;
+    float audio_step;
+    float carrier_step;
+    float deviation_scale;
+
+    if (processing_rate < 1)
+        processing_rate = input_rate;
+    total = seconds > 0 ? processing_rate * seconds : processing_rate;
+    audio_step = 2.0f * (float)M_PI * (float)audio_tone_hz / (float)processing_rate;
+    carrier_step = 2.0f * (float)M_PI * (float)carrier_hz / (float)processing_rate;
+    deviation_scale = 2.0f * (float)M_PI * (float)fm_deviation_hz / (float)processing_rate;
+
+    for (long n = 0; keep_running && n < total; n++) {
+        float audio = sinf(audio_phase);
+        int16_t i_val;
+        int16_t q_val;
+
+        phase += carrier_step + deviation_scale * audio;
+        if (phase > (float)M_PI || phase < -(float)M_PI)
+            phase = fmodf(phase, 2.0f * (float)M_PI);
+        audio_phase += audio_step;
+        if (audio_phase > (float)M_PI)
+            audio_phase -= 2.0f * (float)M_PI;
+
+        i_val = (int16_t)(cosf(phase) * 18000.0f);
+        q_val = (int16_t)(sinf(phase) * 18000.0f);
+        if (dsp_process_iq(dsp, sink, i_val, q_val) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+static int run_iq_file(FILE *sink, struct dsp_state *dsp)
+{
+    const char *path = getenv("PLUTO_AUDIO_IQ_FILE");
+    const char *format = env_default("PLUTO_AUDIO_IQ_FILE_FORMAT", "s12");
+    long max_samples = env_long("PLUTO_AUDIO_IQ_FILE_MAX_SAMPLES", 0, 0, 1000000000L);
+    FILE *in;
+    uint8_t bytes[4];
+    long samples = 0;
+
+    if (!path || !path[0]) {
+        fprintf(stderr, "PLUTO_AUDIO_IQ_FILE is required for iq_file source\n");
+        return -1;
+    }
+    in = fopen(path, "rb");
+    if (!in) {
+        fprintf(stderr, "could not open IQ file %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    backend_phase = "iq_file_streaming";
+    maybe_write_audio_running_report(dsp, true);
+    while (keep_running && fread(bytes, 1, sizeof(bytes), in) == sizeof(bytes)) {
+        int16_t i_sample;
+        int16_t q_sample;
+
+        if (!strcmp(format, "s16")) {
+            memcpy(&i_sample, bytes, sizeof(i_sample));
+            memcpy(&q_sample, bytes + sizeof(uint16_t), sizeof(q_sample));
+        } else {
+            i_sample = unpack_ad9361_s12_sample(bytes);
+            q_sample = unpack_ad9361_s12_sample(bytes + sizeof(uint16_t));
+        }
+        if (dsp_push_iq(dsp, sink, i_sample, q_sample) < 0) {
+            fprintf(stderr, "audio sink write failed while processing IQ file: %s\n", strerror(errno));
+            fclose(in);
+            return -1;
+        }
+        samples++;
+        if (max_samples > 0 && samples >= max_samples)
+            break;
+    }
+    if (ferror(in)) {
+        fprintf(stderr, "could not read IQ file %s: %s\n", path, strerror(errno));
+        fclose(in);
+        return -1;
+    }
+    fclose(in);
+    fflush(sink);
+    maybe_write_audio_running_report(dsp, true);
     return 0;
 }
 
@@ -633,7 +1003,7 @@ static int run_iio(FILE *sink, struct dsp_state *dsp)
         goto out;
     }
 
-    backend_phase = "iio_refill_wait";
+    backend_phase = "streaming";
     maybe_write_audio_running_report(dsp, true);
     while (keep_running) {
         ssize_t refill = iio_buffer_refill(buf);
@@ -654,21 +1024,17 @@ static int run_iio(FILE *sink, struct dsp_state *dsp)
                     (void *)i_ptr, (void *)q_ptr, (void *)end, step);
             goto out;
         }
-        backend_phase = "iio_streaming";
         dsp->iio_refills++;
         for (; keep_running && i_ptr < end && q_ptr < end; i_ptr += step, q_ptr += step) {
-            int16_t i_sample;
-            int16_t q_sample;
-            memcpy(&i_sample, i_ptr, sizeof(i_sample));
-            memcpy(&q_sample, q_ptr, sizeof(q_sample));
-            if (dsp_process_iq(dsp, sink, i_sample, q_sample) < 0) {
+            int16_t i_sample = unpack_ad9361_s12_sample(i_ptr);
+            int16_t q_sample = unpack_ad9361_s12_sample(q_ptr);
+            if (dsp_push_iq(dsp, sink, i_sample, q_sample) < 0) {
                 fprintf(stderr, "audio sink write failed after %" PRIu64 " PCM bytes: %s\n",
                         dsp->pcm_samples * 2U, strerror(errno));
                 goto out;
             }
         }
         fflush(sink);
-        backend_phase = "iio_refill_wait";
         maybe_write_audio_running_report(dsp, true);
     }
     ret = 0;
@@ -689,17 +1055,22 @@ int main(void)
     long input_rate = env_long("PLUTO_DSP_INPUT_RATE_HZ", DEFAULT_IN_RATE, audio_rate, 5000000);
     long filter_width_hz = env_long("PLUTO_AUDIO_FILTER_WIDTH_HZ", 0, 0, input_rate);
     long cw_bfo = env_long("PLUTO_AUDIO_CW_BFO_HZ", 700, 100, 3000);
+    long frequency_shift_hz = env_long("PLUTO_DSP_FREQUENCY_SHIFT_HZ", 0, -input_rate / 2, input_rate / 2);
+    enum iq_mode iq_mode = parse_iq_mode(env_default("PLUTO_DSP_IQ_MODE", "normal"));
     long test_seconds = env_long("PLUTO_AUDIO_TEST_SECONDS", 0, 0, 3600);
     float squelch_db = env_float("PLUTO_AUDIO_SQUELCH_DB", -120.0f, -120.0f, 0.0f);
     float output_gain = env_float("PLUTO_AUDIO_OUTPUT_GAIN", 1.0f, 0.0f, 16.0f);
     float noise_gate_db = env_float("PLUTO_AUDIO_NOISE_GATE_DB", -120.0f, -120.0f, 0.0f);
     bool dc_block = env_bool("PLUTO_AUDIO_DC_BLOCK", true);
+    bool fm_limiter_enabled = env_bool("PLUTO_AUDIO_FM_LIMITER", true);
+    bool fm_channel_filter_enabled = env_bool("PLUTO_AUDIO_FM_CHANNEL_FILTER", true);
     enum demod_mode mode = parse_demod(env_default("PLUTO_AUDIO_DEMOD", "nfm"));
     enum agc_mode agc = parse_agc(env_default("PLUTO_AUDIO_AGC", "manual"));
     const char *deemphasis = env_default("PLUTO_AUDIO_DEEMPHASIS", "none");
     struct dsp_state dsp;
     FILE *sink = NULL;
     int ret;
+    bool regular_sink = !strcmp(source, "iq_file");
 
     if (!fifo || !fifo[0]) {
         fprintf(stderr, "PLUTO_AUDIO_FIFO is required\n");
@@ -711,7 +1082,7 @@ int main(void)
     signal(SIGPIPE, SIG_IGN);
 
     backend_phase = "fifo_wait_for_reader";
-    sink = open_audio_sink(fifo);
+    sink = open_audio_sink(fifo, regular_sink);
     if (!sink) {
         int errnum = errno;
         char message[256];
@@ -725,12 +1096,22 @@ int main(void)
 
     backend_phase = "dsp_init";
     dsp_init(&dsp, mode, input_rate, audio_rate, cw_bfo, filter_width_hz,
-             squelch_db, deemphasis, agc, output_gain, noise_gate_db, dc_block);
+             squelch_db, deemphasis, agc, frequency_shift_hz, output_gain, noise_gate_db,
+             dc_block, iq_mode, fm_limiter_enabled, fm_channel_filter_enabled);
     backend_phase = "running";
     if (!strcmp(source, "synthetic"))
         ret = run_synthetic(sink, &dsp, input_rate, test_seconds);
-    else
+    else if (!strcmp(source, "synthetic_fm"))
+        ret = run_synthetic_fm(sink, &dsp, input_rate, test_seconds);
+    else if (!strcmp(source, "iq_file"))
+        ret = run_iq_file(sink, &dsp);
+    else if (!strcmp(source, "iio"))
         ret = run_iio(sink, &dsp);
+    else {
+        fprintf(stderr, "unsupported PLUTO_AUDIO_SOURCE: %s\n", source);
+        write_audio_error("unsupported_audio_source", "unsupported PLUTO_AUDIO_SOURCE", 0);
+        ret = -1;
+    }
     maybe_write_audio_running_report(&dsp, true);
     dsp_destroy(&dsp);
     if (ret != 0 && keep_running)

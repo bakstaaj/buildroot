@@ -32,6 +32,18 @@ static void handle_signal(int signo)
     keep_running = 0;
 }
 
+static int16_t unpack_ad9361_s12_sample(const void *ptr)
+{
+    uint16_t raw;
+    int32_t value;
+
+    memcpy(&raw, ptr, sizeof(raw));
+    value = (int32_t)(raw & 0x0fff);
+    if (value & 0x0800)
+        value -= 0x1000;
+    return (int16_t)(value << 4);
+}
+
 static const char *env_default(const char *name, const char *fallback)
 {
     const char *value = getenv(name);
@@ -121,6 +133,27 @@ struct tx_state {
     float fm_phase;
     struct audio_state audio;
     struct cw_state cw;
+};
+
+struct tone_metric {
+    double i;
+    double q;
+    double freq_hz;
+};
+
+struct demod_metrics {
+    bool enabled;
+    bool have_last;
+    float last_i;
+    float last_q;
+    long sample_rate;
+    long tone_hz;
+    long carrier_offset_hz;
+    long sample_index;
+    double sumsq;
+    double peak;
+    struct tone_metric tone;
+    struct tone_metric refs[3];
 };
 
 static double monotonic_seconds(void)
@@ -375,6 +408,71 @@ static void fill_tx_modulated(struct iio_buffer *buf, struct iio_channel *i_chan
     }
 }
 
+static void tone_metric_add(struct tone_metric *metric, double sample, long index, long sample_rate)
+{
+    double omega = 2.0 * M_PI * metric->freq_hz / (double)sample_rate;
+    metric->i += sample * cos(omega * (double)index);
+    metric->q -= sample * sin(omega * (double)index);
+}
+
+static void demod_metrics_init(struct demod_metrics *metrics, const char *mode, long sample_rate, long tone_hz, long carrier_offset_hz)
+{
+    memset(metrics, 0, sizeof(*metrics));
+    metrics->enabled = mode_is(mode, "fm") || mode_is(mode, "cw");
+    metrics->sample_rate = sample_rate;
+    metrics->tone_hz = tone_hz;
+    metrics->carrier_offset_hz = carrier_offset_hz;
+    metrics->tone.freq_hz = (double)tone_hz;
+    metrics->refs[0].freq_hz = (double)(tone_hz > 40 ? tone_hz / 2 : 20);
+    metrics->refs[1].freq_hz = (double)(tone_hz * 2);
+    metrics->refs[2].freq_hz = (double)(tone_hz * 3);
+}
+
+static void demod_metrics_add_iq(struct demod_metrics *metrics, const char *mode, float i_val, float q_val)
+{
+    double sample;
+    int r;
+
+    if (!metrics->enabled)
+        return;
+    if (mode_is(mode, "fm")) {
+        if (!metrics->have_last) {
+            metrics->last_i = i_val;
+            metrics->last_q = q_val;
+            metrics->have_last = true;
+            return;
+        }
+        sample = atan2((double)metrics->last_i * (double)q_val - (double)metrics->last_q * (double)i_val,
+                       (double)metrics->last_i * (double)i_val + (double)metrics->last_q * (double)q_val);
+        sample -= 2.0 * M_PI * (double)metrics->carrier_offset_hz / (double)metrics->sample_rate;
+        while (sample > M_PI)
+            sample -= 2.0 * M_PI;
+        while (sample < -M_PI)
+            sample += 2.0 * M_PI;
+        metrics->last_i = i_val;
+        metrics->last_q = q_val;
+    } else if (mode_is(mode, "cw")) {
+        sample = sqrt((double)i_val * (double)i_val + (double)q_val * (double)q_val);
+    } else {
+        return;
+    }
+
+    metrics->sumsq += sample * sample;
+    if (fabs(sample) > metrics->peak)
+        metrics->peak = fabs(sample);
+    tone_metric_add(&metrics->tone, sample, metrics->sample_index, metrics->sample_rate);
+    for (r = 0; r < 3; r++)
+        tone_metric_add(&metrics->refs[r], sample, metrics->sample_index, metrics->sample_rate);
+    metrics->sample_index++;
+}
+
+static double tone_metric_magnitude(const struct tone_metric *metric, long count)
+{
+    if (count <= 0)
+        return 0.0;
+    return sqrt(metric->i * metric->i + metric->q * metric->q) * 2.0 / (double)count;
+}
+
 static int run_loopback(void)
 {
     const char *mode = env_default("PLUTO_TX_MODE", "loopback");
@@ -387,7 +485,11 @@ static int run_loopback(void)
     long tone_hz = env_long("PLUTO_LOOPBACK_TONE_HZ", 10000, 0, sample_rate / 4);
     long buffer_samples = env_long("PLUTO_LOOPBACK_BUFFER_SAMPLES", 4096, 256, 65536);
     float amplitude = env_float("PLUTO_LOOPBACK_TX_AMPLITUDE", 0.05f, 0.0f, 0.25f);
-    bool tx_only = strcmp(mode, "loopback") != 0 || strcmp(env_default("PLUTO_TX_ONLY", "0"), "1") == 0;
+    bool tx_only = strcmp(env_default("PLUTO_TX_ONLY", "0"), "0") != 0;
+    long expect_tone_hz = env_long("PLUTO_LOOPBACK_EXPECT_TONE_HZ",
+                                   mode_is(mode, "cw") ? 0 : env_long("PLUTO_TX_AUDIO_TONE_HZ", 1000, 20, 3000),
+                                   0, sample_rate / 4);
+    long carrier_offset_hz = env_long("PLUTO_LOOPBACK_RX_IF_OFFSET_HZ", 0, -1000000, 1000000);
     struct tx_config tx_cfg = {
         .mode = strcmp(mode, "tx_only") == 0 ? "tone" : mode,
         .audio_source = env_default("PLUTO_TX_AUDIO_SOURCE", "tone"),
@@ -416,12 +518,14 @@ static int run_loopback(void)
     double sumsq = 0.0;
     double peak = 0.0;
     unsigned long long samples = 0;
+    struct demod_metrics demod;
     int ret = 1;
 
     memset(&tx_state, 0, sizeof(tx_state));
     build_cw_units(&tx_state.cw, tx_cfg.cw_text, sample_rate, tx_cfg.cw_wpm);
-    if (tx_only && audio_open(&tx_state.audio, &tx_cfg) < 0)
+    if (audio_open(&tx_state.audio, &tx_cfg) < 0)
         goto out;
+    demod_metrics_init(&demod, tx_cfg.mode, sample_rate, expect_tone_hz, carrier_offset_hz);
 
     ctx = iio_create_default_context();
     if (!ctx) {
@@ -444,16 +548,16 @@ static int run_loopback(void)
         goto out;
     }
 
-    tx_buf = iio_device_create_buffer(tx_dev, (size_t)buffer_samples, !tx_only);
+    tx_buf = iio_device_create_buffer(tx_dev, (size_t)buffer_samples, false);
     rx_buf = tx_only ? NULL : iio_device_create_buffer(rx_dev, (size_t)buffer_samples, false);
     if (!tx_buf || (!rx_buf && !tx_only)) {
         fprintf(stderr, "could not create loopback IIO buffers\n");
         goto out;
     }
-    if (tx_only)
-        fill_tx_modulated(tx_buf, tx_i, &tx_cfg, &tx_state);
-    else
+    if (mode_is(tx_cfg.mode, "loopback"))
         fill_tx_tone(tx_buf, tx_i, sample_rate, tone_hz, amplitude);
+    else
+        fill_tx_modulated(tx_buf, tx_i, &tx_cfg, &tx_state);
     if (iio_buffer_push(tx_buf) < 0) {
         fprintf(stderr, "TX buffer push failed\n");
         goto out;
@@ -474,6 +578,12 @@ static int run_loopback(void)
             }
             continue;
         }
+        if (!mode_is(tx_cfg.mode, "loopback"))
+            fill_tx_modulated(tx_buf, tx_i, &tx_cfg, &tx_state);
+        if (iio_buffer_push(tx_buf) < 0) {
+            fprintf(stderr, "TX buffer push failed\n");
+            goto out;
+        }
         refill = iio_buffer_refill(rx_buf);
         if (refill < 0) {
             fprintf(stderr, "RX buffer refill failed: %zd\n", refill);
@@ -483,15 +593,15 @@ static int run_loopback(void)
         end = iio_buffer_end(rx_buf);
         step = iio_buffer_step(rx_buf);
         for (; ptr < end; ptr += step) {
-            const int16_t *sample = (const int16_t *)ptr;
-            double i_val = (double)sample[0] / 32768.0;
-            double q_val = (double)sample[1] / 32768.0;
+            double i_val = (double)unpack_ad9361_s12_sample(ptr) / 32768.0;
+            double q_val = (double)unpack_ad9361_s12_sample(ptr + sizeof(uint16_t)) / 32768.0;
             double mag2 = i_val * i_val + q_val * q_val;
             double mag = sqrt(mag2);
 
             sumsq += mag2;
             if (mag > peak)
                 peak = mag;
+            demod_metrics_add_iq(&demod, tx_cfg.mode, (float)i_val, (float)q_val);
             samples++;
         }
     }
@@ -513,12 +623,45 @@ out:
         double rms_dbfs = 20.0 * log10(rms > 1.0e-9 ? rms : 1.0e-9);
         double peak_dbfs = 20.0 * log10(peak > 1.0e-9 ? peak : 1.0e-9);
 
-        printf("{\"ok\":true,\"samples\":%llu,\"duration_ms\":%ld,"
-               "\"sample_rate_hz\":%ld,\"tone_hz\":%ld,"
-               "\"tx_amplitude\":%.6f,\"rx_rms_dbfs\":%.2f,"
-               "\"rx_peak_dbfs\":%.2f}\n",
-               samples, duration_ms, sample_rate, tone_hz,
-               amplitude, rms_dbfs, peak_dbfs);
+        if (demod.enabled && demod.sample_index > 0) {
+            double tone_mag = tone_metric_magnitude(&demod.tone, demod.sample_index);
+            double ref_mag = tone_metric_magnitude(&demod.refs[0], demod.sample_index);
+            int r;
+            double demod_rms = sqrt(demod.sumsq / (double)demod.sample_index);
+            double tone_dbfs = 20.0 * log10(tone_mag > 1.0e-9 ? tone_mag : 1.0e-9);
+            double ref_dbfs;
+            double tone_snr_db;
+            for (r = 1; r < 3; r++) {
+                double mag = tone_metric_magnitude(&demod.refs[r], demod.sample_index);
+                if (mag > ref_mag)
+                    ref_mag = mag;
+            }
+            ref_dbfs = 20.0 * log10(ref_mag > 1.0e-9 ? ref_mag : 1.0e-9);
+            tone_snr_db = tone_dbfs - ref_dbfs;
+            printf("{\"ok\":true,\"samples\":%llu,\"duration_ms\":%ld,"
+                   "\"sample_rate_hz\":%ld,\"tx_mode\":\"%s\","
+                   "\"carrier_offset_hz\":%ld,"
+                   "\"tone_hz\":%ld,\"detected_tone_hz\":%ld,"
+                   "\"tx_amplitude\":%.6f,\"rx_rms_dbfs\":%.2f,"
+                   "\"rx_peak_dbfs\":%.2f,\"demod_sample_count\":%ld,"
+                   "\"demod_rms\":%.9f,\"tone_dbfs\":%.2f,"
+                   "\"reference_dbfs\":%.2f,\"tone_snr_db\":%.2f,"
+                   "\"pass_snr_db_min\":6.00,"
+                   "\"passed\":%s}\n",
+                   samples, duration_ms, sample_rate, tx_cfg.mode,
+                   carrier_offset_hz,
+                   expect_tone_hz, expect_tone_hz,
+                   amplitude, rms_dbfs, peak_dbfs, demod.sample_index,
+                   demod_rms, tone_dbfs, ref_dbfs, tone_snr_db,
+                   (tone_snr_db >= 6.0 ? "true" : "false"));
+        } else {
+            printf("{\"ok\":true,\"samples\":%llu,\"duration_ms\":%ld,"
+                   "\"sample_rate_hz\":%ld,\"tone_hz\":%ld,"
+                   "\"tx_amplitude\":%.6f,\"rx_rms_dbfs\":%.2f,"
+                   "\"rx_peak_dbfs\":%.2f}\n",
+                   samples, duration_ms, sample_rate, tone_hz,
+                   amplitude, rms_dbfs, peak_dbfs);
+        }
     } else if (ret == 0) {
         printf("{\"ok\":true,\"mode\":\"tx_only\",\"tx_mode\":\"%s\",\"duration_ms\":%ld,"
                "\"sample_rate_hz\":%ld,\"tone_hz\":%ld,"

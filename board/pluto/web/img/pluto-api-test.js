@@ -37,12 +37,52 @@ const endpoints = [
   {
     id: "audio-start",
     category: "Receive",
-    label: "Start Audio",
+    label: "Start Audio Sim",
     method: "POST",
     path: "/radio/audio/start",
     description: "Start the receiver audio backend in simulation mode.",
     payload: { profile: "NOAA_NFM", simulate: true },
     summary: data => data.audio || {},
+  },
+  {
+    id: "audio-start-live",
+    category: "Receive",
+    label: "Start NOAA Live",
+    method: "POST",
+    path: "/radio/audio/start",
+    description: "Apply NOAA_NFM, force RX streaming mode, and start live decoded audio.",
+    payload: { profile: "NOAA_NFM", frequency_hz: 162550000, simulate: false, squelch_db: -90, gain_db: 60, gain_control_mode: "manual" },
+    summary: data => data.audio || {},
+  },
+  {
+    id: "audio-retune",
+    category: "Receive",
+    label: "Retune Live Audio",
+    method: "POST",
+    path: "/radio/audio/retune",
+    description: "Retune RX LO/gain without restarting the running audio backend.",
+    payload: { profile: "NOAA_NFM", frequency_hz: 162550000, gain_db: 60, gain_control_mode: "manual" },
+    summary: data => ({ audio: data.audio, writes: data.writes }),
+  },
+  {
+    id: "demod-self-test",
+    category: "Receive",
+    label: "FM Demod Self-Test",
+    method: "POST",
+    path: "/radio/audio/demod-self-test",
+    description: "Run a synthetic FM I/Q self-test through the receiver demod DSP without RF.",
+    payload: { profile: "NOAA_NFM", simulate: true, duration_seconds: 2, capture_seconds: 1, tone_hz: 1000, fm_deviation_hz: 5000 },
+    summary: data => data.demod_self_test || {},
+  },
+  {
+    id: "audio-live-wav",
+    category: "Receive",
+    label: "Continuous WAV",
+    method: "GET",
+    path: "/radio/audio/live.wav?continuous=true",
+    description: "Open the browser-suitable continuous WAV stream endpoint.",
+    stream: true,
+    summary: data => data,
   },
   {
     id: "audio-status",
@@ -92,6 +132,16 @@ const endpoints = [
     description: "Run a short simulated loopback diagnostic.",
     payload: { profile: "LOOPBACK_TEST", simulate: true, duration_seconds: 1 },
     summary: data => data.loopback || {},
+  },
+  {
+    id: "loopback-demod",
+    category: "Diagnostics",
+    label: "FM Demod Loopback",
+    method: "POST",
+    path: "/radio/loopback/demod",
+    description: "Run a simulated TX FM tone through the RX demod diagnostic.",
+    payload: { simulate: true, frequency_hz: 915000000, duration_seconds: 2, capture_seconds: 1, rx_gain_db: 35, tx_gain_db: -35, tx_amplitude: 0.2, tx_audio_tone_hz: 1000 },
+    summary: data => data.loopback_demod || {},
   },
   {
     id: "guardrails",
@@ -392,6 +442,14 @@ async function runSelected() {
         message: "Check the live TX confirmation box before transmitting RF.",
       },
     }, "Live TX blocked");
+    return;
+  }
+
+  if (selectedEndpoint.stream) {
+    const url = endpointUrl(path);
+    window.open(url, "_blank", "noopener");
+    renderQuick({ stream: url });
+    showResponse({ ok: true, stream_url: url, note: "Opened stream URL in a new browser tab/window." }, `${selectedEndpoint.label} opened`, { status: "stream", elapsedMs: 0 });
     return;
   }
 
