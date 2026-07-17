@@ -24,6 +24,9 @@
 #define DEFAULT_AUDIO_RATE 12000
 #define DEFAULT_BUFFER_SAMPLES 4096
 #define INT16_CLIP 32767.0f
+#define CW_LIVE_TEXT_MAX 256
+#define CW_LIVE_SYMBOL_MAX 32
+#define CW_LIVE_SYMBOLS_MAX 512
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -50,6 +53,32 @@ enum iq_mode {
     IQ_SWAP_INVERT_I,
     IQ_SWAP_INVERT_Q,
     IQ_SWAP_INVERT_BOTH,
+};
+
+struct cw_live_decoder {
+    bool enabled;
+    bool have_level;
+    bool have_state;
+    bool current_keyed;
+    long requested_wpm;
+    int unit_ms;
+    int min_unit_ms;
+    int max_unit_ms;
+    unsigned audio_rate;
+    unsigned samples_in_ms;
+    unsigned ms_samples;
+    double ms_sum;
+    double floor;
+    double peak;
+    double threshold;
+    unsigned run_ms;
+    unsigned keying_segments;
+    unsigned keyed_ms;
+    unsigned total_ms;
+    int pattern_len;
+    char pattern[CW_LIVE_SYMBOL_MAX];
+    char decoded_text[CW_LIVE_TEXT_MAX];
+    char decoded_symbols[CW_LIVE_SYMBOLS_MAX];
 };
 
 static volatile sig_atomic_t keep_running = 1;
@@ -119,6 +148,7 @@ struct dsp_state {
     float agc_release;
     int64_t i_acc;
     int64_t q_acc;
+    struct cw_live_decoder cw_live;
 };
 
 static void handle_signal(int signo)
@@ -194,6 +224,207 @@ static bool env_bool(const char *name, bool fallback)
     if (!strcmp(raw, "1") || !strcmp(raw, "true") || !strcmp(raw, "on") || !strcmp(raw, "yes"))
         return true;
     return fallback;
+}
+
+static char morse_decode_char(const char *pattern)
+{
+    struct morse_entry {
+        const char *pattern;
+        char value;
+    };
+    static const struct morse_entry table[] = {
+        {".-", 'A'}, {"-...", 'B'}, {"-.-.", 'C'}, {"-..", 'D'}, {".", 'E'},
+        {"..-.", 'F'}, {"--.", 'G'}, {"....", 'H'}, {"..", 'I'}, {".---", 'J'},
+        {"-.-", 'K'}, {".-..", 'L'}, {"--", 'M'}, {"-.", 'N'}, {"---", 'O'},
+        {".--.", 'P'}, {"--.-", 'Q'}, {".-.", 'R'}, {"...", 'S'}, {"-", 'T'},
+        {"..-", 'U'}, {"...-", 'V'}, {".--", 'W'}, {"-..-", 'X'}, {"-.--", 'Y'},
+        {"--..", 'Z'}, {"-----", '0'}, {".----", '1'}, {"..---", '2'},
+        {"...--", '3'}, {"....-", '4'}, {".....", '5'}, {"-....", '6'},
+        {"--...", '7'}, {"---..", '8'}, {"----.", '9'},
+    };
+    size_t i;
+
+    if (!pattern || !pattern[0])
+        return '\0';
+    for (i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        if (!strcmp(pattern, table[i].pattern))
+            return table[i].value;
+    }
+    return '?';
+}
+
+static void append_char(char *buf, size_t len, char value)
+{
+    size_t used = strlen(buf);
+
+    if (used + 1 >= len) {
+        size_t keep = len / 2;
+        if (keep == 0 || used < keep)
+            return;
+        memmove(buf, buf + (used - keep), keep);
+        buf[keep] = '\0';
+        used = keep;
+    }
+    buf[used] = value;
+    buf[used + 1] = '\0';
+}
+
+static void append_text(char *buf, size_t len, const char *value)
+{
+    size_t used = strlen(buf);
+    size_t remaining;
+
+    if (!value || !value[0] || used + 1 >= len)
+        append_char(buf, len, ' ');
+    used = strlen(buf);
+    if (used + 1 >= len)
+        return;
+    remaining = len - used - 1;
+    strncat(buf, value, remaining);
+}
+
+static int units_from_ms(unsigned run_ms, int unit_ms)
+{
+    if (unit_ms <= 0)
+        return 1;
+    return (int)(((int)run_ms + unit_ms / 2) / unit_ms);
+}
+
+static void cw_live_flush_symbol(struct cw_live_decoder *cw)
+{
+    char decoded;
+
+    if (!cw || cw->pattern_len <= 0)
+        return;
+    cw->pattern[cw->pattern_len] = '\0';
+    decoded = morse_decode_char(cw->pattern);
+    append_char(cw->decoded_text, sizeof(cw->decoded_text), decoded);
+    append_text(cw->decoded_symbols, sizeof(cw->decoded_symbols), cw->pattern);
+    append_char(cw->decoded_symbols, sizeof(cw->decoded_symbols), ' ');
+    cw->pattern_len = 0;
+}
+
+static void cw_live_finish_run(struct cw_live_decoder *cw, bool keyed, unsigned run_ms)
+{
+    int units;
+    unsigned min_run_ms;
+
+    if (!cw || !cw->enabled || run_ms == 0)
+        return;
+    min_run_ms = (unsigned)(cw->unit_ms / 4);
+    if (min_run_ms < 8)
+        min_run_ms = 8;
+    if (run_ms < min_run_ms)
+        return;
+
+    units = units_from_ms(run_ms, cw->unit_ms);
+    if (keyed) {
+        cw->keying_segments++;
+        cw->keyed_ms += run_ms;
+        if (cw->pattern_len + 1 < CW_LIVE_SYMBOL_MAX)
+            cw->pattern[cw->pattern_len++] = units >= 2 ? '-' : '.';
+    } else if (units >= 7) {
+        cw_live_flush_symbol(cw);
+        if (cw->decoded_text[0] && cw->decoded_text[strlen(cw->decoded_text) - 1] != ' ')
+            append_char(cw->decoded_text, sizeof(cw->decoded_text), ' ');
+        append_text(cw->decoded_symbols, sizeof(cw->decoded_symbols), "/ ");
+    } else if (units >= 3) {
+        cw_live_flush_symbol(cw);
+    }
+}
+
+static void cw_live_init(struct cw_live_decoder *cw, enum demod_mode mode, unsigned audio_rate)
+{
+    long requested_wpm;
+
+    memset(cw, 0, sizeof(*cw));
+    cw->enabled = mode == DEMOD_CW && env_bool("PLUTO_CW_DECODE_ENABLED", true);
+    cw->audio_rate = audio_rate;
+    cw->samples_in_ms = audio_rate >= 1000 ? audio_rate / 1000U : 1U;
+    requested_wpm = env_long("PLUTO_CW_DECODE_WPM", 0, 0, 60);
+    cw->requested_wpm = requested_wpm;
+    cw->unit_ms = requested_wpm > 0 ? (int)(1200L / requested_wpm) : 100;
+    if (cw->unit_ms < 20)
+        cw->unit_ms = 20;
+    if (cw->unit_ms > 300)
+        cw->unit_ms = 300;
+    if (requested_wpm > 0) {
+        cw->min_unit_ms = (cw->unit_ms * 3) / 4;
+        cw->max_unit_ms = (cw->unit_ms * 3) / 2;
+    } else {
+        cw->min_unit_ms = 20;
+        cw->max_unit_ms = 300;
+    }
+}
+
+static void cw_live_update_unit(struct cw_live_decoder *cw, unsigned run_ms)
+{
+    int candidate;
+
+    if (!cw || !cw->enabled || run_ms == 0)
+        return;
+    candidate = (int)run_ms;
+    if (candidate > cw->unit_ms * 2)
+        candidate = (candidate + 1) / 3;
+    if (candidate < cw->min_unit_ms)
+        candidate = cw->min_unit_ms;
+    if (candidate > cw->max_unit_ms)
+        candidate = cw->max_unit_ms;
+    cw->unit_ms = (cw->unit_ms * 7 + candidate) / 8;
+}
+
+static void cw_live_process_ms(struct cw_live_decoder *cw, double level)
+{
+    bool keyed;
+
+    if (!cw || !cw->enabled)
+        return;
+    if (!cw->have_level) {
+        cw->floor = level;
+        cw->peak = level;
+        cw->threshold = level;
+        cw->have_level = true;
+    }
+    if (level < cw->floor)
+        cw->floor += (level - cw->floor) * 0.08;
+    else
+        cw->floor += (level - cw->floor) * 0.002;
+    if (level > cw->peak)
+        cw->peak += (level - cw->peak) * 0.08;
+    else
+        cw->peak += (level - cw->peak) * 0.004;
+    cw->threshold = cw->floor + ((cw->peak - cw->floor) * 0.45);
+    keyed = level >= cw->threshold && cw->peak > cw->floor * 1.5;
+
+    cw->total_ms++;
+    if (!cw->have_state) {
+        cw->current_keyed = keyed;
+        cw->run_ms = 1;
+        cw->have_state = true;
+        return;
+    }
+    if (keyed == cw->current_keyed) {
+        cw->run_ms++;
+        return;
+    }
+    if (cw->current_keyed)
+        cw_live_update_unit(cw, cw->run_ms);
+    cw_live_finish_run(cw, cw->current_keyed, cw->run_ms);
+    cw->current_keyed = keyed;
+    cw->run_ms = 1;
+}
+
+static void cw_live_add_audio(struct cw_live_decoder *cw, float audio)
+{
+    if (!cw || !cw->enabled)
+        return;
+    cw->ms_sum += fabs((double)audio);
+    cw->ms_samples++;
+    if (cw->ms_samples >= cw->samples_in_ms) {
+        cw_live_process_ms(cw, cw->ms_sum / (double)cw->ms_samples);
+        cw->ms_sum = 0.0;
+        cw->ms_samples = 0;
+    }
 }
 
 static void json_string(FILE *out, const char *value)
@@ -380,6 +611,39 @@ static void write_audio_running_report(struct dsp_state *dsp)
             env_long("PLUTO_DSP_INPUT_RATE_HZ", DEFAULT_IN_RATE, 4000, 5000000) / (long)dsp->iq_decim);
     fprintf(out, "  \"rms_level\": %.8g,\n", rms);
     json_string_field(out, "squelch_state", dsp->squelch_enabled ? (dsp->squelch_open ? "open" : "closed") : "disabled", true);
+    if (dsp->cw_live.enabled) {
+        char current_symbol[CW_LIVE_SYMBOL_MAX];
+        int estimated_wpm = dsp->cw_live.unit_ms > 0 ? (1200 + dsp->cw_live.unit_ms / 2) / dsp->cw_live.unit_ms : 0;
+        double keyed_percent = dsp->cw_live.total_ms > 0
+            ? (100.0 * (double)dsp->cw_live.keyed_ms / (double)dsp->cw_live.total_ms)
+            : 0.0;
+
+        memcpy(current_symbol, dsp->cw_live.pattern, sizeof(current_symbol));
+        current_symbol[sizeof(current_symbol) - 1] = '\0';
+        fprintf(out, "  \"cw_decode\": {\n");
+        fprintf(out, "    \"decode_supported\": true,\n");
+        fprintf(out, "    \"requested_wpm\": %ld,\n", dsp->cw_live.requested_wpm);
+        fprintf(out, "    \"estimated_wpm\": %d,\n", estimated_wpm);
+        fprintf(out, "    \"estimated_unit_ms\": %d,\n", dsp->cw_live.unit_ms);
+        fprintf(out, "    \"keyed_percent\": %.2f,\n", keyed_percent);
+        fprintf(out, "    \"keying_segments\": %u,\n", dsp->cw_live.keying_segments);
+        fprintf(out, "    \"envelope_floor\": %.8g,\n", dsp->cw_live.floor);
+        fprintf(out, "    \"envelope_peak\": %.8g,\n", dsp->cw_live.peak);
+        fprintf(out, "    \"envelope_threshold\": %.8g,\n", dsp->cw_live.threshold);
+        fprintf(out, "    \"current_symbol\": ");
+        json_string(out, current_symbol);
+        fputs(",\n", out);
+        fprintf(out, "    \"decoded_symbols\": ");
+        json_string(out, dsp->cw_live.decoded_symbols);
+        fputs(",\n", out);
+        fprintf(out, "    \"decoded_text\": ");
+        json_string(out, dsp->cw_live.decoded_text);
+        fputs(",\n", out);
+        fprintf(out, "    \"timing_source\": \"streaming_auto\"\n");
+        fprintf(out, "  },\n");
+    } else {
+        fprintf(out, "  \"cw_decode\": null,\n");
+    }
     json_string_field(out, "started_utc", getenv("PLUTO_AUDIO_STARTED_UTC"), true);
     json_string_field(out, "state", "running", true);
     json_string_field(out, "stream_format", env_default("PLUTO_AUDIO_STREAM_FORMAT", "pcm_s16le"), true);
@@ -616,6 +880,7 @@ static void dsp_init(struct dsp_state *dsp, enum demod_mode mode, long input_rat
     dsp->agc_target = 9000.0f;
     dsp->agc_attack = agc == AGC_FAST ? 0.020f : 0.004f;
     dsp->agc_release = agc == AGC_FAST ? 0.004f : 0.001f;
+    cw_live_init(&dsp->cw_live, mode, dsp->audio_rate);
 
     if (mode == DEMOD_WFM) {
         dsp->scale = 15500.0f;
@@ -689,6 +954,7 @@ static int dsp_emit(struct dsp_state *dsp, FILE *sink, float sample)
     audio *= dsp->output_gain;
     if (dsp->noise_gate_enabled && dbfs(fabsf(audio) / INT16_CLIP) < dsp->noise_gate_threshold_db)
         audio = 0.0f;
+    cw_live_add_audio(&dsp->cw_live, audio);
     int16_t pcm = clamp_pcm(audio);
     if (write_pcm(sink, pcm) < 0)
         return -1;
