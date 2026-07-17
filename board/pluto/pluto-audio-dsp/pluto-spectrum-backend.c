@@ -9,12 +9,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
 #define DEFAULT_DEVICE "cf-ad9361-lpc"
 #define DEFAULT_I_CHAN "voltage0"
 #define DEFAULT_Q_CHAN "voltage1"
+#define DEFAULT_RX_LO_ATTR "/sys/bus/iio/devices/iio:device0/out_altvoltage0_RX_LO_frequency"
 #define DEFAULT_SAMPLE_RATE 2400000L
 #define DEFAULT_BUFFER_SAMPLES 4096L
 #define INT16_SCALE 32768.0
@@ -99,6 +101,42 @@ static double dbfs(double power)
     return 10.0 * log10(power);
 }
 
+static int env_bool(const char *name, int fallback)
+{
+    const char *raw = getenv(name);
+
+    if (!raw || !raw[0])
+        return fallback;
+    if (!strcmp(raw, "1") || !strcasecmp(raw, "true") || !strcasecmp(raw, "yes") || !strcasecmp(raw, "on"))
+        return 1;
+    if (!strcmp(raw, "0") || !strcasecmp(raw, "false") || !strcasecmp(raw, "no") || !strcasecmp(raw, "off"))
+        return 0;
+    return fallback;
+}
+
+static int write_ll_attr_path(const char *path, long long value)
+{
+    FILE *fp;
+
+    if (!path || !path[0])
+        return 1;
+    fp = fopen(path, "w");
+    if (!fp) {
+        fprintf(stderr, "could not open %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    if (fprintf(fp, "%lld", value) < 0) {
+        fprintf(stderr, "could not write %s: %s\n", path, strerror(errno));
+        fclose(fp);
+        return 1;
+    }
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "could not close %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
 static int16_t unpack_ad9361_s12_sample(const void *ptr)
 {
     uint16_t raw;
@@ -116,6 +154,15 @@ static long long now_epoch_ms(void)
     struct timespec ts;
 
     if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+        return 0;
+    return ((long long)ts.tv_sec * 1000LL) + ((long long)ts.tv_nsec / 1000000LL);
+}
+
+static long long monotonic_ms(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
         return 0;
     return ((long long)ts.tv_sec * 1000LL) + ((long long)ts.tv_nsec / 1000000LL);
 }
@@ -320,7 +367,10 @@ static void compute_points(const int16_t *iq, long samples, long sample_rate,
         double freq = start_hz + (step_hz * (double)b);
         double offset_hz = freq - (double)center_hz;
         double phase_step = -2.0 * M_PI * offset_hz / (double)sample_rate;
-        double phase = 0.0;
+        double osc_i = 1.0;
+        double osc_q = 0.0;
+        double step_i = cos(phase_step);
+        double step_q = sin(phase_step);
         double acc_i = 0.0;
         double acc_q = 0.0;
         long n;
@@ -328,14 +378,13 @@ static void compute_points(const int16_t *iq, long samples, long sample_rate,
         for (n = 0; n < samples; n++) {
             double i_val = (double)iq[n * 2] / INT16_SCALE;
             double q_val = (double)iq[n * 2 + 1] / INT16_SCALE;
-            double c = cos(phase);
-            double s = sin(phase);
+            double next_i;
 
-            acc_i += i_val * c - q_val * s;
-            acc_q += i_val * s + q_val * c;
-            phase += phase_step;
-            if (phase > M_PI || phase < -M_PI)
-                phase = fmod(phase, 2.0 * M_PI);
+            acc_i += i_val * osc_i - q_val * osc_q;
+            acc_q += i_val * osc_q + q_val * osc_i;
+            next_i = osc_i * step_i - osc_q * step_q;
+            osc_q = osc_i * step_q + osc_q * step_i;
+            osc_i = next_i;
         }
 
         points[b].frequency_hz = (long long)llround(freq);
@@ -346,10 +395,10 @@ static void compute_points(const int16_t *iq, long samples, long sample_rate,
     *noise_floor = bins > 0 ? sum_power / (double)bins : -120.0;
 }
 
-static void print_spectrum_json(long sequence, int stream_mode, long samples, long sample_rate,
+static void print_spectrum_json(long sequence, int stream_mode, int continuous, long samples, long sample_rate,
                                 long long center_hz, long span_hz, int bins, int top_n,
                                 int follow_doppler, const struct point *points, const struct point *peaks,
-                                double noise_floor)
+                                double noise_floor, long long frame_ms)
 {
     int i;
 
@@ -357,10 +406,10 @@ static void print_spectrum_json(long sequence, int stream_mode, long samples, lo
         printf("{\"ok\":true,\"type\":\"spectrum_row\",\"sequence\":%ld,\"time_epoch\":%ld,"
                "\"sample_count\":%ld,\"sample_rate_hz\":%ld,\"center_frequency_hz\":%lld,"
                "\"span_hz\":%ld,\"bins\":%d,\"backend\":\"external_stream\",\"bounded\":false,"
-               "\"follow_doppler\":%s,"
+               "\"continuous\":%s,\"follow_doppler\":%s,\"frame_duration_ms\":%lld,"
                "\"points\":[",
                sequence, (long)time(NULL), samples, sample_rate, center_hz, span_hz, bins,
-               follow_doppler ? "true" : "false");
+               continuous ? "true" : "false", follow_doppler ? "true" : "false", frame_ms);
     } else {
         printf("{\"sample_count\":%ld,\"sample_rate_hz\":%ld,\"points\":[", samples, sample_rate);
     }
@@ -391,6 +440,15 @@ static void sleep_ms(long interval_ms)
         ;
 }
 
+static void sleep_until_ms(long long deadline_ms)
+{
+    long long now_ms = monotonic_ms();
+
+    if (deadline_ms <= 0 || now_ms <= 0 || now_ms >= deadline_ms)
+        return;
+    sleep_ms((long)(deadline_ms - now_ms));
+}
+
 int main(void)
 {
     long long center_hz = env_ll("PLUTO_SPECTRUM_CENTER_HZ", 145800000LL, 70000000LL, 6000000000LL);
@@ -400,8 +458,11 @@ int main(void)
     int bins = (int)env_long("PLUTO_SPECTRUM_BINS", 256L, 16L, 1024L);
     int top_n = (int)env_long("PLUTO_SPECTRUM_TOP_N", 5L, 1L, 20L);
     int stream_mode = (int)env_long("PLUTO_SPECTRUM_STREAM", 0L, 0L, 1L);
-    long frames = env_long("PLUTO_SPECTRUM_FRAMES", stream_mode ? 120L : 1L, 1L, 3600L);
+    long frames = env_long("PLUTO_SPECTRUM_FRAMES", stream_mode ? 120L : 1L, 0L, 3600L);
     long interval_ms = env_long("PLUTO_SPECTRUM_INTERVAL_MS", 250L, 0L, 60000L);
+    int continuous = stream_mode && frames == 0;
+    int tune_rx = env_bool("PLUTO_SPECTRUM_TUNE_RX", 0);
+    const char *rx_lo_attr = env_default("PLUTO_SPECTRUM_RX_LO_ATTR", DEFAULT_RX_LO_ATTR);
     int16_t *iq = NULL;
     struct point *points = NULL;
     struct point *peaks = NULL;
@@ -436,11 +497,18 @@ int main(void)
         cap_ready = 1;
     }
 
-    for (sequence = 0; sequence < frames; sequence++) {
+    for (sequence = 0; frames == 0 || sequence < frames; sequence++) {
         double noise_floor = -120.0;
         long long frame_center_hz = doppler_center_hz(&doppler, center_hz);
+        long long frame_start_ms = monotonic_ms();
+        long long next_frame_ms = frame_start_ms + interval_ms;
+        long long frame_end_ms;
         int ret;
 
+        if (tune_rx && frame_center_hz != center_hz) {
+            if (write_ll_attr_path(rx_lo_attr, frame_center_hz) != 0)
+                goto fail;
+        }
         ret = stream_mode ? refill_iq(&cap, iq) : capture_iq(iq, samples);
         if (ret != 0)
             goto fail;
@@ -448,12 +516,14 @@ int main(void)
         compute_points(iq, samples, sample_rate, frame_center_hz, span_hz, bins, points, &noise_floor);
         memcpy(peaks, points, (size_t)bins * sizeof(*points));
         qsort(peaks, (size_t)bins, sizeof(*peaks), point_cmp_desc);
-        print_spectrum_json(sequence, stream_mode, samples, sample_rate, frame_center_hz,
-                            span_hz, bins, top_n, doppler.count > 0, points, peaks, noise_floor);
+        frame_end_ms = monotonic_ms();
+        print_spectrum_json(sequence, stream_mode, continuous, samples, sample_rate, frame_center_hz,
+                            span_hz, bins, top_n, doppler.count > 0, points, peaks, noise_floor,
+                            frame_end_ms > frame_start_ms ? frame_end_ms - frame_start_ms : 0);
         if (!stream_mode)
             break;
-        if (sequence + 1 < frames)
-            sleep_ms(interval_ms);
+        if (frames == 0 || sequence + 1 < frames)
+            sleep_until_ms(next_frame_ms);
     }
 
     if (cap_ready)

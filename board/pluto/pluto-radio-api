@@ -896,7 +896,21 @@ def apply_profile_fir_mode(device, profile):
         rf_bandwidth = int(profile.get("rf_bandwidth_hz") or 0)
         if sample_rate == 520999 and rf_bandwidth == 521000:
             writes.append(write_attr(device, "filter_fir_config", AD9361_FIR_521K_CONFIG, required=True))
-    writes.append(write_attr(device, "in_out_voltage_filter_fir_en", enabled, required=True))
+    current = read_attr(device, "in_out_voltage_filter_fir_en")
+    if current == enabled:
+        writes.append({"attr": "in_out_voltage_filter_fir_en", "value": enabled, "status": "unchanged"})
+        return writes
+    result = write_attr(device, "in_out_voltage_filter_fir_en", enabled, required=False)
+    writes.append(result)
+    if result.get("status") in {"error", "missing"}:
+        writes.append(write_attr(device, "in_voltage_filter_fir_en", enabled, required=False))
+    if read_attr(device, "in_out_voltage_filter_fir_en") != enabled and read_attr(device, "in_voltage_filter_fir_en") != enabled:
+        raise ApiError(
+            "radio_write_failed",
+            "failed changing FIR enable state",
+            status=503,
+            details={"target": enabled, "writes": writes},
+        )
     return writes
 
 
@@ -1894,6 +1908,23 @@ def spectrum_request(payload):
     return profile, center_hz, span_hz, bins, top_n, sample_rate, simulate
 
 
+def prepare_spectrum_radio(profile, center_hz, payload):
+    apply_payload = {
+        "profile": profile["name"],
+        "frequency_hz": center_hz,
+    }
+    if "gain_db" in payload:
+        apply_payload["gain_db"] = payload["gain_db"]
+    if "gain_control_mode" in payload:
+        apply_payload["gain_control_mode"] = payload["gain_control_mode"]
+    result = apply_profile(apply_payload)
+    device = find_iio_device()
+    writes = list(result.get("writes", []))
+    writes.append(write_attr(device, "ensm_mode", "fdd"))
+    sample_rate = read_attr(device, "in_voltage_sampling_frequency") or profile.get("sample_rate_hz", "")
+    return writes, sample_rate
+
+
 def spectrum_status():
     state = load_spectrum_state()
     return {
@@ -1916,6 +1947,7 @@ def spectrum_status():
 
 def spectrum_snapshot(payload):
     profile, center_hz, span_hz, bins, top_n, sample_rate, simulate = spectrum_request(payload)
+    writes = []
 
     if simulate:
         points, peaks, noise_floor = simulated_spectrum(center_hz, span_hz, bins, top_n)
@@ -1928,6 +1960,7 @@ def spectrum_snapshot(payload):
                 last_error={"code": "spectrum_backend_missing", "message": message, "time_utc": now_utc()},
             )
             raise ApiError("spectrum_backend_missing", message, status=503)
+        writes, sample_rate = prepare_spectrum_radio(profile, center_hz, payload)
         env = os.environ.copy()
         env.update(
             {
@@ -1973,6 +2006,7 @@ def spectrum_snapshot(payload):
             "points": points,
             "backend": backend,
             "bounded": True,
+            "writes": writes,
         },
     }
 
@@ -1994,7 +2028,8 @@ def spectrum_top(payload):
 
 def spectrum_stream_to_writer(payload, write_line, before_stream=None):
     profile, center_hz, span_hz, bins, top_n, sample_rate, simulate = spectrum_request(payload)
-    frames = validate_uint(payload.get("frames", 120), "frames", 1, SPECTRUM_MAX_STREAM_FRAMES)
+    continuous = validate_bool(payload.get("continuous", False), "continuous")
+    frames = 0 if continuous else validate_uint(payload.get("frames", 120), "frames", 1, SPECTRUM_MAX_STREAM_FRAMES)
     interval_ms = validate_uint(payload.get("interval_ms", 250), "interval_ms", 50, 60000)
     follow_doppler = validate_bool(payload.get("follow_doppler", False), "follow_doppler")
     doppler_plan_for_stream = None
@@ -2014,6 +2049,9 @@ def spectrum_stream_to_writer(payload, write_line, before_stream=None):
         )
         raise ApiError("spectrum_backend_missing", message, status=503)
 
+    if not simulate:
+        _writes, sample_rate = prepare_spectrum_radio(profile, center_hz, payload)
+
     if before_stream:
         before_stream()
 
@@ -2023,6 +2061,7 @@ def spectrum_stream_to_writer(payload, write_line, before_stream=None):
         center_frequency_hz=center_hz,
         span_hz=span_hz,
         bins=bins,
+        continuous=continuous,
         follow_doppler=follow_doppler,
         backend="simulated_stream" if simulate else "external_stream",
         last_error=None,
@@ -2030,10 +2069,12 @@ def spectrum_stream_to_writer(payload, write_line, before_stream=None):
 
     try:
         if simulate:
-            for sequence in range(frames):
+            sequence = 0
+            while continuous or sequence < frames:
                 frame_center_hz = center_hz
                 if follow_doppler and doppler_plan_for_stream:
                     frame_center_hz = doppler_center_from_plan(doppler_plan_for_stream, int(time.time() * 1000)) or center_hz
+                frame_started = time.time()
                 points, peaks, noise_floor = simulated_spectrum(frame_center_hz, span_hz, bins, top_n, sequence)
                 write_line(
                     json.dumps(
@@ -2049,7 +2090,9 @@ def spectrum_stream_to_writer(payload, write_line, before_stream=None):
                             "bins": bins,
                             "backend": "simulated_stream",
                             "bounded": False,
+                            "continuous": continuous,
                             "follow_doppler": follow_doppler,
+                            "frame_duration_ms": int((time.time() - frame_started) * 1000),
                             "points": points,
                             "peaks": peaks,
                             "noise_floor_dbfs": noise_floor,
@@ -2057,7 +2100,8 @@ def spectrum_stream_to_writer(payload, write_line, before_stream=None):
                         sort_keys=True,
                     )
                 )
-                if sequence + 1 < frames:
+                sequence += 1
+                if continuous or sequence < frames:
                     time.sleep(interval_ms / 1000.0)
         else:
             if follow_doppler and doppler_plan_for_stream:
@@ -2074,6 +2118,7 @@ def spectrum_stream_to_writer(payload, write_line, before_stream=None):
                     "PLUTO_SPECTRUM_STREAM": "1",
                     "PLUTO_SPECTRUM_FRAMES": str(frames),
                     "PLUTO_SPECTRUM_INTERVAL_MS": str(interval_ms),
+                    "PLUTO_SPECTRUM_TUNE_RX": "1" if follow_doppler else "0",
                 }
             )
             if follow_doppler and doppler_plan_for_stream and doppler_table_file:
@@ -2085,14 +2130,27 @@ def spectrum_stream_to_writer(payload, write_line, before_stream=None):
                 )
             proc = subprocess.Popen([str(SPECTRUM_BACKEND)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, bufsize=1)
             assert proc.stdout is not None
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                write_line(line)
+            client_gone = False
+            try:
+                for line in proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        write_line(line)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        client_gone = True
+                        break
+            finally:
+                if client_gone and proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
             stderr = proc.stderr.read() if proc.stderr is not None else ""
             rc = proc.wait()
-            if rc != 0:
+            if rc != 0 and not client_gone:
                 raise ApiError("spectrum_stream_failed", "spectrum backend stream failed", status=503, details={"returncode": rc, "stderr": stderr[-300:]})
     finally:
         save_spectrum_state(
@@ -2101,6 +2159,7 @@ def spectrum_stream_to_writer(payload, write_line, before_stream=None):
             center_frequency_hz=center_hz,
             span_hz=span_hz,
             bins=bins,
+            continuous=continuous,
             follow_doppler=follow_doppler,
             backend="simulated_stream" if simulate else "external_stream",
             last_snapshot_utc=now_utc(),
@@ -2118,6 +2177,37 @@ def spectrum_stream(payload):
         sys.stdout.flush()
 
     spectrum_stream_to_writer(payload, write_line)
+
+
+def spectrum_stream_collect(payload):
+    rows = []
+
+    def write_line(line):
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise ApiError("spectrum_stream_invalid_json", "spectrum backend emitted invalid JSON", details={"line": line[:200]}) from exc
+
+    spectrum_stream_to_writer(payload, write_line)
+    frame_durations = [
+        row.get("frame_duration_ms")
+        for row in rows
+        if isinstance(row, dict) and row.get("frame_duration_ms") is not None
+    ]
+    return {
+        "ok": len(rows) > 0 and all(isinstance(row, dict) and row.get("ok", False) for row in rows),
+        "spectrum_stream": {
+            "rows": len(rows),
+            "first_sequence": rows[0].get("sequence") if rows else None,
+            "last_sequence": rows[-1].get("sequence") if rows else None,
+            "center_frequency_hz": rows[-1].get("center_frequency_hz") if rows else None,
+            "span_hz": rows[-1].get("span_hz") if rows else None,
+            "bins": rows[-1].get("bins") if rows else None,
+            "backend": rows[-1].get("backend") if rows else None,
+            "frame_duration_ms": frame_durations,
+        },
+        "bounded": True,
+    }
 
 
 def loopback_status():
@@ -3555,9 +3645,9 @@ def start_loopback_cw(payload):
     tx_payload = dict(payload)
     tx_payload["profile"] = payload.get("tx_profile", "TX_CW")
     tx_payload.setdefault("tx_mode", "cw")
-    tx_payload.setdefault("duration_seconds", 6)
-    tx_payload.setdefault("tx_gain_db", -40)
-    tx_payload.setdefault("tx_amplitude", 0.05)
+    tx_payload.setdefault("duration_seconds", 10)
+    tx_payload.setdefault("tx_gain_db", -35)
+    tx_payload.setdefault("tx_amplitude", 0.08)
     tx_payload.setdefault("tx_cw_text", "CQ TEST")
     tx_payload.setdefault("tx_cw_wpm", 12)
     tx_plan = validate_tx(tx_payload)
@@ -3591,7 +3681,7 @@ def start_loopback_cw(payload):
             "rx_frequency_hz - rx_if_offset_hz is below the AD9361 tuning range",
             details={"rx_frequency_hz": rx_frequency_hz, "rx_if_offset_hz": rx_if_offset_hz},
         )
-    capture_seconds = validate_uint(payload.get("capture_seconds", min(5, tx_plan["duration_seconds"])), "capture_seconds", 1, tx_plan["duration_seconds"])
+    capture_seconds = validate_uint(payload.get("capture_seconds", min(9, tx_plan["duration_seconds"])), "capture_seconds", 1, tx_plan["duration_seconds"])
     cw_bfo_hz = validate_uint(payload.get("cw_bfo_hz", rx_profile.get("cw_bfo_hz", 700)), "cw_bfo_hz", 100, 3000)
 
     simulate = dry_run() or str(payload.get("simulate", "")).lower() in {"1", "true", "yes"}
@@ -3611,10 +3701,18 @@ def start_loopback_cw(payload):
                 "bfo_hz": cw_bfo_hz,
                 "requested_wpm": tx_plan["tx_cw_wpm"],
                 "estimated_wpm": tx_plan["tx_cw_wpm"],
+                "estimated_unit_ms": round(1200.0 / max(1, tx_plan["tx_cw_wpm"]), 2),
+                "timing_source": "simulated",
                 "keyed_percent": 45.0,
                 "keying_segments": 8,
-                "decode_supported": False,
+                "decoded_symbols": "-.-. --.- / - . ... - ",
+                "decoded_text": tx_plan["tx_cw_text"],
+                "expected_text": tx_plan["tx_cw_text"],
+                "matched_expected": True,
+                "decode_supported": True,
             },
+            "decoded_text": tx_plan["tx_cw_text"],
+            "decoded_symbols": "-.-. --.- / - . ... - ",
             "simulated": True,
         }
         state = save_loopback_demod_state(
@@ -3675,17 +3773,26 @@ def start_loopback_cw(payload):
             running_state,
         )
         metrics = state.get("metrics") or {}
+        backend_decode = metrics.get("cw_decode") if isinstance(metrics.get("cw_decode"), dict) else None
         try:
             metrics["passed"] = float(metrics.get("rx_peak_dbfs", -120.0)) > -85.0
             metrics["pass_criteria"] = {"rx_peak_dbfs_min": -85.0}
         except (TypeError, ValueError):
             metrics["passed"] = False
             metrics["pass_criteria"] = {"rx_peak_dbfs_min": -85.0}
-        metrics["keying"] = {
-            "requested_wpm": tx_plan["tx_cw_wpm"],
-            "decode_supported": False,
-            "decode_note": "This endpoint verifies recovered CW RF energy/keying. Morse text decode is not enabled yet.",
-        }
+        if backend_decode:
+            metrics["keying"] = backend_decode
+            metrics["decoded_text"] = backend_decode.get("decoded_text")
+            metrics["decoded_symbols"] = backend_decode.get("decoded_symbols")
+            if backend_decode.get("matched_expected") is not None:
+                metrics["passed"] = bool(metrics["passed"] and backend_decode.get("matched_expected"))
+                metrics["pass_criteria"]["matched_expected_text"] = True
+        else:
+            metrics["keying"] = {
+                "requested_wpm": tx_plan["tx_cw_wpm"],
+                "decode_supported": False,
+                "decode_note": "This endpoint verified recovered CW RF energy/keying, but no decoder metrics were returned.",
+            }
         state = save_loopback_demod_state(metrics=metrics)
         return {"ok": True, "loopback_cw": state, "writes": writes, "bounded": True}
     except ApiError as exc:
@@ -4023,10 +4130,63 @@ def self_test_step(name, func, required=True):
         return {"name": name, "ok": False, "required": required, "error": {"code": "internal_error", "message": str(exc)}}
 
 
+def self_test_cw_wpm_values(payload):
+    raw_values = payload.get("cw_wpm_values", [12, 20])
+    if not isinstance(raw_values, list):
+        raise ApiError("invalid_value", "cw_wpm_values must be a JSON array of WPM values")
+    if not raw_values:
+        raise ApiError("invalid_value", "cw_wpm_values must include at least one WPM value")
+    if len(raw_values) > 6:
+        raise ApiError("invalid_value", "cw_wpm_values is limited to 6 entries")
+    values = []
+    for index, value in enumerate(raw_values):
+        wpm = validate_uint(value, f"cw_wpm_values[{index}]", 5, 40)
+        if wpm not in values:
+            values.append(wpm)
+    return values
+
+
+def self_test_cw_loopback_payload(payload, wpm):
+    duration_seconds = validate_uint(payload.get("cw_duration_seconds", 10), "cw_duration_seconds", 3, LOOPBACK_MAX_SECONDS)
+    capture_seconds = validate_uint(payload.get("cw_capture_seconds", max(1, duration_seconds - 1)), "cw_capture_seconds", 1, duration_seconds)
+    frequency_hz = validate_uint(payload.get("loopback_frequency_hz", payload.get("frequency_hz", 915_000_000)), "loopback_frequency_hz", 70_000_000, 6_000_000_000)
+    return {
+        "confirm_live_tx": True,
+        "frequency_hz": frequency_hz,
+        "rx_profile": payload.get("cw_rx_profile", "UHF_CW_LOOPBACK"),
+        "tx_profile": payload.get("cw_tx_profile", "TX_CW"),
+        "rx_if_offset_hz": validate_uint(payload.get("cw_rx_if_offset_hz", 25_000), "cw_rx_if_offset_hz", 0, 1_000_000),
+        "rx_gain_db": validate_decimal(payload.get("cw_rx_gain_db", payload.get("gain_db", 35)), "cw_rx_gain_db"),
+        "tx_gain_db": validate_decimal(payload.get("cw_tx_gain_db", -35), "cw_tx_gain_db"),
+        "tx_amplitude": validate_decimal(payload.get("cw_tx_amplitude", 0.08), "cw_tx_amplitude", 0.001, 1.0),
+        "tx_cw_text": str(payload.get("cw_text", "CQ TEST")),
+        "tx_cw_wpm": wpm,
+        "duration_seconds": duration_seconds,
+        "capture_seconds": capture_seconds,
+    }
+
+
+def self_test_spectrum_live_payload(payload):
+    return {
+        "profile": payload.get("spectrum_profile", "IQ_CAPTURE"),
+        "center_frequency_hz": validate_uint(payload.get("spectrum_center_frequency_hz", payload.get("frequency_hz", 915_000_000)), "spectrum_center_frequency_hz", 70_000_000, 6_000_000_000),
+        "span_hz": validate_uint(payload.get("spectrum_span_hz", 200_000), "spectrum_span_hz", 1_000, 60_000_000),
+        "bins": validate_uint(payload.get("spectrum_bins", 64), "spectrum_bins", 8, 1024),
+        "top_n": validate_uint(payload.get("spectrum_top_n", 3), "spectrum_top_n", 0, 50),
+        "frames": validate_uint(payload.get("spectrum_frames", 5), "spectrum_frames", 1, min(50, SPECTRUM_MAX_STREAM_FRAMES)),
+        "interval_ms": validate_uint(payload.get("spectrum_interval_ms", 100), "spectrum_interval_ms", 50, 60000),
+        "simulate": "false",
+    }
+
+
 def self_test(payload=None):
     payload = payload or {}
     require_radio = validate_bool(payload.get("require_radio", False), "require_radio")
     tx_duration = validate_uint(payload.get("tx_duration_seconds", 1), "tx_duration_seconds", 1, min(3, TX_MAX_SECONDS))
+    live_loopback = validate_bool(payload.get("live_loopback", False), "live_loopback")
+    live_spectrum = validate_bool(payload.get("live_spectrum", False), "live_spectrum")
+    if live_loopback and not tx_confirmation(payload):
+        raise ApiError("tx_confirmation_required", "set confirm_live_tx=true to run bounded live RF loopback self-tests", status=403)
     steps = [
         self_test_step("profiles", list_profiles),
         self_test_step("radio-status", radio_status, required=require_radio),
@@ -4073,13 +4233,30 @@ def self_test(payload=None):
         ),
         self_test_step("tx-stop", stop_tx),
     ]
+    if live_loopback:
+        for wpm in self_test_cw_wpm_values(payload):
+            steps.append(
+                self_test_step(
+                    f"loopback-cw-{wpm}wpm",
+                    lambda wpm=wpm: start_loopback_cw(self_test_cw_loopback_payload(payload, wpm)),
+                )
+            )
+        steps.append(self_test_step("tx-stop-after-loopback", stop_tx))
+    if live_spectrum:
+        steps.append(
+            self_test_step(
+                "spectrum-live-stream",
+                lambda: spectrum_stream_collect(self_test_spectrum_live_payload(payload)),
+                required=require_radio,
+            )
+        )
     required_failures = [step for step in steps if step["required"] and not step["ok"]]
     optional_failures = [step for step in steps if not step["required"] and not step["ok"]]
     state = "fail" if required_failures else "warn" if optional_failures else "pass"
     saved = save_self_test_state(
         state=state,
-        safe=True,
-        live_tx=False,
+        safe=not live_loopback,
+        live_tx=live_loopback,
         required_failures=len(required_failures),
         optional_failures=len(optional_failures),
         completed_utc=now_utc(),
@@ -4088,8 +4265,8 @@ def self_test(payload=None):
         "ok": not required_failures,
         "self_test": {
             "state": state,
-            "safe": True,
-            "live_tx": False,
+            "safe": not live_loopback,
+            "live_tx": live_loopback,
             "steps": steps,
             "required_failures": len(required_failures),
             "optional_failures": len(optional_failures),
