@@ -4118,6 +4118,16 @@ def self_test_step(name, func, required=True):
     try:
         result = func()
         ok = result.get("ok", True) if isinstance(result, dict) else True
+        if isinstance(result, dict):
+            for key in ("loopback_cw", "loopback_demod", "demod_self_test", "loopback"):
+                nested = result.get(key)
+                if not isinstance(nested, dict):
+                    continue
+                metrics = nested.get("metrics")
+                if isinstance(metrics, dict) and metrics.get("passed") is False:
+                    ok = False
+                if isinstance(metrics, dict) and metrics.get("ok") is False:
+                    ok = False
         return {"name": name, "ok": bool(ok), "required": required, "result": result}
     except ApiError as exc:
         return {
@@ -4146,9 +4156,78 @@ def self_test_cw_wpm_values(payload):
     return values
 
 
+MORSE_UNIT_SYMBOLS = {
+    "A": ".-",
+    "B": "-...",
+    "C": "-.-.",
+    "D": "-..",
+    "E": ".",
+    "F": "..-.",
+    "G": "--.",
+    "H": "....",
+    "I": "..",
+    "J": ".---",
+    "K": "-.-",
+    "L": ".-..",
+    "M": "--",
+    "N": "-.",
+    "O": "---",
+    "P": ".--.",
+    "Q": "--.-",
+    "R": ".-.",
+    "S": "...",
+    "T": "-",
+    "U": "..-",
+    "V": "...-",
+    "W": ".--",
+    "X": "-..-",
+    "Y": "-.--",
+    "Z": "--..",
+    "0": "-----",
+    "1": ".----",
+    "2": "..---",
+    "3": "...--",
+    "4": "....-",
+    "5": ".....",
+    "6": "-....",
+    "7": "--...",
+    "8": "---..",
+    "9": "----.",
+}
+
+
+def cw_text_units(text):
+    total = 0
+    pending_char_gap = False
+    for char in text.upper():
+        if char == " ":
+            if total:
+                total += 7
+            pending_char_gap = False
+            continue
+        symbols = MORSE_UNIT_SYMBOLS.get(char)
+        if not symbols:
+            continue
+        if pending_char_gap:
+            total += 3
+        total += sum(3 if symbol == "-" else 1 for symbol in symbols)
+        total += max(0, len(symbols) - 1)
+        pending_char_gap = True
+    return total
+
+
+def self_test_cw_duration_seconds(payload, wpm, text):
+    if "cw_duration_seconds" in payload:
+        return validate_uint(payload.get("cw_duration_seconds"), "cw_duration_seconds", 3, TX_MAX_SECONDS)
+    units = cw_text_units(text)
+    message_seconds = (units * 1.2) / max(1, wpm)
+    return min(TX_MAX_SECONDS, max(10, int(math.ceil(message_seconds + 8))))
+
+
 def self_test_cw_loopback_payload(payload, wpm):
-    duration_seconds = validate_uint(payload.get("cw_duration_seconds", 10), "cw_duration_seconds", 3, LOOPBACK_MAX_SECONDS)
-    capture_seconds = validate_uint(payload.get("cw_capture_seconds", max(1, duration_seconds - 1)), "cw_capture_seconds", 1, duration_seconds)
+    cw_text = str(payload.get("cw_text", "CQ TEST"))
+    duration_seconds = self_test_cw_duration_seconds(payload, wpm, cw_text)
+    capture_seconds = validate_uint(payload.get("cw_capture_seconds", duration_seconds), "cw_capture_seconds", 1, duration_seconds)
     frequency_hz = validate_uint(payload.get("loopback_frequency_hz", payload.get("frequency_hz", 915_000_000)), "loopback_frequency_hz", 70_000_000, 6_000_000_000)
     return {
         "confirm_live_tx": True,
@@ -4159,7 +4238,7 @@ def self_test_cw_loopback_payload(payload, wpm):
         "rx_gain_db": validate_decimal(payload.get("cw_rx_gain_db", payload.get("gain_db", 35)), "cw_rx_gain_db"),
         "tx_gain_db": validate_decimal(payload.get("cw_tx_gain_db", -35), "cw_tx_gain_db"),
         "tx_amplitude": validate_decimal(payload.get("cw_tx_amplitude", 0.08), "cw_tx_amplitude", 0.001, 1.0),
-        "tx_cw_text": str(payload.get("cw_text", "CQ TEST")),
+        "tx_cw_text": cw_text,
         "tx_cw_wpm": wpm,
         "duration_seconds": duration_seconds,
         "capture_seconds": capture_seconds,

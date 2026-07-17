@@ -20,7 +20,7 @@
   "stream_format": "sc16_iq",
   "tx_allowed": true,
   "tx_mode": "cw",
-  "tx_duration_limit_seconds": 10,
+  "tx_duration_limit_seconds": 30,
   "tx_gain_db": -30.0,
   "tx_tone_hz": 0,
   "tx_amplitude": 0.05,

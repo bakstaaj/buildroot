@@ -20,7 +20,7 @@
 #define DEFAULT_Q_CHAN "voltage1"
 #define INT16_MAX_F 32767.0f
 #define CW_UNITS_MAX 2048
-#define CW_DECODE_MAX_MS 12000
+#define CW_DECODE_MAX_MS 30000
 #define CW_DECODE_SYMBOL_MAX 16
 #define CW_DECODE_TEXT_MAX 128
 #define CW_DECODE_RUNS_MAX 512
@@ -472,6 +472,8 @@ static int estimate_cw_unit_ms(const unsigned char *keyed, int count, int fallba
     int mark_unit;
     int space_unit;
     int unit;
+    int min_unit;
+    int max_unit;
     int j;
 
     if (count <= 0)
@@ -516,6 +518,16 @@ static int estimate_cw_unit_ms(const unsigned char *keyed, int count, int fallba
         unit = 20;
     if (unit > 300)
         unit = 300;
+    min_unit = (fallback_unit_ms * 3) / 4;
+    max_unit = (fallback_unit_ms * 3) / 2;
+    if (min_unit < 20)
+        min_unit = 20;
+    if (max_unit > 300)
+        max_unit = 300;
+    if (unit < min_unit)
+        unit = min_unit;
+    if (unit > max_unit)
+        unit = max_unit;
     return unit;
 }
 
@@ -952,7 +964,7 @@ static int run_loopback(void)
     const char *i_name = env_default("PLUTO_LOOPBACK_I_CHANNEL", DEFAULT_I_CHAN);
     const char *q_name = env_default("PLUTO_LOOPBACK_Q_CHANNEL", DEFAULT_Q_CHAN);
     long sample_rate = env_long("PLUTO_LOOPBACK_SAMPLE_RATE_HZ", 1000000, 520000, 61440000);
-    long duration_ms = env_long("PLUTO_LOOPBACK_DURATION_MS", 1000, 50, 10000);
+    long duration_ms = env_long("PLUTO_LOOPBACK_DURATION_MS", 1000, 50, 30000);
     long tone_hz = env_long("PLUTO_LOOPBACK_TONE_HZ", 10000, 0, sample_rate / 4);
     long buffer_samples = env_long("PLUTO_LOOPBACK_BUFFER_SAMPLES", 4096, 256, 65536);
     float amplitude = env_float("PLUTO_LOOPBACK_TX_AMPLITUDE", 0.05f, 0.0f, 0.25f);
