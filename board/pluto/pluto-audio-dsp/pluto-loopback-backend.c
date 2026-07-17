@@ -901,7 +901,7 @@ static void tone_metric_add(struct tone_metric *metric, double sample, long inde
 static void demod_metrics_init(struct demod_metrics *metrics, const char *mode, long sample_rate, long tone_hz, long carrier_offset_hz)
 {
     memset(metrics, 0, sizeof(*metrics));
-    metrics->enabled = mode_is(mode, "fm") || mode_is(mode, "cw");
+    metrics->enabled = mode_is(mode, "fm") || mode_is(mode, "am") || mode_is(mode, "cw");
     metrics->sample_rate = sample_rate;
     metrics->tone_hz = tone_hz;
     metrics->carrier_offset_hz = carrier_offset_hz;
@@ -934,7 +934,7 @@ static void demod_metrics_add_iq(struct demod_metrics *metrics, const char *mode
             sample += 2.0 * M_PI;
         metrics->last_i = i_val;
         metrics->last_q = q_val;
-    } else if (mode_is(mode, "cw")) {
+    } else if (mode_is(mode, "am") || mode_is(mode, "cw")) {
         sample = sqrt((double)i_val * (double)i_val + (double)q_val * (double)q_val);
     } else {
         return;

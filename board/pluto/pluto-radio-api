@@ -2231,6 +2231,7 @@ def loopback_status():
             "profile": state.get("profile"),
             "frequency_hz": state.get("frequency_hz"),
             "duration_seconds": state.get("duration_seconds"),
+            "capture_seconds": state.get("capture_seconds"),
             "tx_gain_db": state.get("tx_gain_db"),
             "tx_tone_hz": state.get("tx_tone_hz"),
             "tx_amplitude": state.get("tx_amplitude"),
@@ -3045,6 +3046,7 @@ def loopback_demod_status():
         "ok": True,
         "loopback_demod": {
             "state": state.get("state", "idle"),
+            "mode": state.get("mode"),
             "rx_profile": state.get("rx_profile"),
             "tx_profile": state.get("tx_profile"),
             "rx_frequency_hz": state.get("rx_frequency_hz"),
@@ -3052,10 +3054,14 @@ def loopback_demod_status():
             "rx_if_offset_hz": state.get("rx_if_offset_hz"),
             "tx_frequency_hz": state.get("tx_frequency_hz"),
             "duration_seconds": state.get("duration_seconds"),
+            "capture_seconds": state.get("capture_seconds"),
             "tx_gain_db": state.get("tx_gain_db"),
             "tx_amplitude": state.get("tx_amplitude"),
             "tx_audio_tone_hz": state.get("tx_audio_tone_hz"),
             "tx_fm_deviation_hz": state.get("tx_fm_deviation_hz"),
+            "tx_am_modulation_index": state.get("tx_am_modulation_index"),
+            "tx_cw_text": state.get("tx_cw_text"),
+            "tx_cw_wpm": state.get("tx_cw_wpm"),
             "metrics": state.get("metrics"),
             "started_utc": state.get("started_utc"),
             "completed_utc": state.get("completed_utc"),
@@ -3364,33 +3370,50 @@ def run_loopback_backend_full_duplex(
 def start_loopback_demod(payload):
     rx_profile = get_profile(payload.get("rx_profile", "NOAA_NFM"))
     demod, audio_rate = audio_capable_profile(rx_profile)
-    if demod not in {"nfm", "wfm"}:
-        raise ApiError("invalid_rx_profile", "loopback demod diagnostic requires an FM receive profile", details={"rx_profile": rx_profile["name"]})
+    if demod not in {"nfm", "wfm", "am"}:
+        raise ApiError(
+            "invalid_rx_profile",
+            "loopback demod diagnostic requires an FM or AM receive profile",
+            details={"rx_profile": rx_profile["name"], "demod_mode": demod},
+        )
 
+    default_tx_profile = "TX_AUDIO_AM" if demod == "am" else "TX_AUDIO_FM"
+    default_tx_mode = "am" if demod == "am" else "fm"
+    default_tx_amplitude = 0.05 if demod == "am" else 0.20
     tx_payload = dict(payload)
-    tx_payload["profile"] = payload.get("tx_profile", "TX_AUDIO_FM")
-    tx_payload.setdefault("tx_mode", "fm")
+    tx_payload["profile"] = payload.get("tx_profile", default_tx_profile)
+    tx_payload.setdefault("tx_mode", default_tx_mode)
     tx_payload.setdefault("tx_audio_source", "tone")
     tx_payload.setdefault("tx_audio_tone_hz", 1000)
     tx_payload.setdefault("tx_fm_deviation_hz", 5000)
+    tx_payload.setdefault("tx_am_modulation_index", 0.8)
     tx_payload.setdefault("duration_seconds", 5)
     tx_payload.setdefault("tx_gain_db", -35)
-    tx_payload.setdefault("tx_amplitude", 0.20)
+    tx_payload.setdefault("tx_amplitude", default_tx_amplitude)
+
+    rx_frequency_default = rx_profile.get("translated_frequency_hz", rx_profile.get("default_frequency_hz"))
+    if rx_frequency_default is not None and "frequency_hz" not in tx_payload and "tx_frequency_hz" not in tx_payload:
+        tx_payload["frequency_hz"] = rx_frequency_default
+
     tx_plan = validate_tx(tx_payload)
-    if tx_plan["tx_mode"] != "fm" or tx_plan["tx_audio_source"] != "tone":
-        raise ApiError("invalid_tx_profile", "loopback demod diagnostic requires FM tone TX", details={"tx_profile": tx_plan["profile"]["name"]})
+    if tx_plan["tx_mode"] != default_tx_mode or tx_plan["tx_audio_source"] != "tone":
+        raise ApiError(
+            "invalid_tx_profile",
+            f"loopback {demod} demod diagnostic requires {default_tx_mode.upper()} tone TX",
+            details={"tx_profile": tx_plan["profile"]["name"], "tx_mode": tx_plan["tx_mode"]},
+        )
 
     if not tx_confirmation(payload):
         raise ApiError("tx_confirmation_required", "set confirm_live_tx=true to run bounded live RF loopback demod", status=403)
 
     rx_frequency_hz = validate_uint(
-        payload.get("rx_frequency_hz", payload.get("frequency_hz", tx_plan["frequency_hz"])),
+        payload.get("rx_frequency_hz", payload.get("frequency_hz", rx_frequency_default if rx_frequency_default is not None else tx_plan["frequency_hz"])),
         "rx_frequency_hz",
         70_000_000,
         6_000_000_000,
     )
     tx_plan["frequency_hz"] = validate_uint(
-        payload.get("tx_frequency_hz", payload.get("frequency_hz", tx_plan["frequency_hz"])),
+        payload.get("tx_frequency_hz", payload.get("frequency_hz", rx_frequency_hz)),
         "tx_frequency_hz",
         70_000_000,
         6_000_000_000,
@@ -3399,7 +3422,8 @@ def start_loopback_demod(payload):
     rx_gain_mode = payload.get("rx_gain_control_mode", payload.get("gain_control_mode", rx_profile.get("gain_control_mode", "manual")))
     if rx_gain_mode not in GAIN_MODES:
         raise ApiError("invalid_value", "rx_gain_control_mode is invalid", details={"rx_gain_control_mode": rx_gain_mode})
-    rx_if_offset_hz = validate_uint(payload.get("rx_if_offset_hz", rx_profile.get("rx_if_offset_hz", 25_000)), "rx_if_offset_hz", 0, 1_000_000)
+    default_rx_if_offset_hz = rx_profile.get("rx_if_offset_hz", rx_profile.get("frequency_shift_hz", 25_000))
+    rx_if_offset_hz = validate_uint(payload.get("rx_if_offset_hz", default_rx_if_offset_hz), "rx_if_offset_hz", 0, 1_000_000)
     rx_lo_frequency_hz = rx_frequency_hz - rx_if_offset_hz
     if rx_lo_frequency_hz < 70_000_000:
         raise ApiError(
@@ -3427,6 +3451,7 @@ def start_loopback_demod(payload):
         }
         state = save_loopback_demod_state(
             state="complete",
+            mode=default_tx_mode,
             rx_profile=rx_profile["name"],
             tx_profile=tx_plan["profile"]["name"],
             rx_frequency_hz=rx_frequency_hz,
@@ -3434,10 +3459,14 @@ def start_loopback_demod(payload):
             rx_if_offset_hz=rx_if_offset_hz,
             tx_frequency_hz=tx_plan["frequency_hz"],
             duration_seconds=tx_plan["duration_seconds"],
+            capture_seconds=capture_seconds,
             tx_gain_db=tx_plan["tx_gain_db"],
             tx_amplitude=tx_plan["tx_amplitude"],
             tx_audio_tone_hz=tone_hz,
             tx_fm_deviation_hz=tx_plan["tx_fm_deviation_hz"],
+            tx_am_modulation_index=tx_plan["tx_am_modulation_index"],
+            tx_cw_text=None,
+            tx_cw_wpm=None,
             metrics=metrics,
             started_utc=now_utc(),
             completed_utc=now_utc(),
@@ -3448,7 +3477,7 @@ def start_loopback_demod(payload):
     started_utc = now_utc()
     running_state = save_loopback_demod_state(
         state="running",
-        mode="fm",
+        mode=default_tx_mode,
         rx_profile=rx_profile["name"],
         tx_profile=tx_plan["profile"]["name"],
         rx_frequency_hz=rx_frequency_hz,
@@ -3461,6 +3490,9 @@ def start_loopback_demod(payload):
         tx_amplitude=tx_plan["tx_amplitude"],
         tx_audio_tone_hz=tone_hz,
         tx_fm_deviation_hz=tx_plan["tx_fm_deviation_hz"],
+        tx_am_modulation_index=tx_plan["tx_am_modulation_index"],
+        tx_cw_text=None,
+        tx_cw_wpm=None,
         started_utc=started_utc,
         completed_utc=None,
         metrics=None,
@@ -3476,7 +3508,7 @@ def start_loopback_demod(payload):
             rx_gain_db,
             rx_gain_mode,
             capture_seconds,
-            "fm",
+            default_tx_mode,
             tone_hz,
             running_state,
         )
@@ -3685,7 +3717,8 @@ def start_loopback_cw(payload):
     rx_gain_mode = payload.get("rx_gain_control_mode", payload.get("gain_control_mode", rx_profile.get("gain_control_mode", "manual")))
     if rx_gain_mode not in GAIN_MODES:
         raise ApiError("invalid_value", "rx_gain_control_mode is invalid", details={"rx_gain_control_mode": rx_gain_mode})
-    rx_if_offset_hz = validate_uint(payload.get("rx_if_offset_hz", rx_profile.get("rx_if_offset_hz", 25_000)), "rx_if_offset_hz", 0, 1_000_000)
+    default_rx_if_offset_hz = rx_profile.get("rx_if_offset_hz", rx_profile.get("frequency_shift_hz", 25_000))
+    rx_if_offset_hz = validate_uint(payload.get("rx_if_offset_hz", default_rx_if_offset_hz), "rx_if_offset_hz", 0, 1_000_000)
     rx_lo_frequency_hz = rx_frequency_hz - rx_if_offset_hz
     if rx_lo_frequency_hz < 70_000_000:
         raise ApiError(

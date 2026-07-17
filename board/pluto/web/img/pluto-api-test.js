@@ -136,10 +136,10 @@ const endpoints = [
   {
     id: "loopback-demod",
     category: "Diagnostics",
-    label: "FM Demod Loopback",
+    label: "Audio Demod Loopback",
     method: "POST",
     path: "/radio/loopback/demod",
-    description: "Run a simulated TX FM tone through the RX demod diagnostic.",
+    description: "Run a simulated TX FM or AM tone through the RX demod diagnostic.",
     payload: { simulate: true, frequency_hz: 915000000, duration_seconds: 2, capture_seconds: 1, rx_gain_db: 35, tx_gain_db: -35, tx_amplitude: 0.2, tx_audio_tone_hz: 1000 },
     summary: data => data.loopback_demod || {},
   },
