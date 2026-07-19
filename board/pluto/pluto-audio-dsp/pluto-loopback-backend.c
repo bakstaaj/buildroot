@@ -14,6 +14,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <ft8/constants.h>
+#include <ft8/encode.h>
+#include <ft8/message.h>
+
 #define DEFAULT_RX_DEVICE "cf-ad9361-lpc"
 #define DEFAULT_TX_DEVICE "cf-ad9361-dds-core-lpc"
 #define DEFAULT_I_CHAN "voltage0"
@@ -117,11 +121,27 @@ struct cw_state {
     long samples_per_unit;
 };
 
+struct ft8_state {
+    uint8_t tones[FT8_NN];
+    float *pulse;
+    long slot_sample;
+    long slot_samples;
+    long signal_start_sample;
+    long signal_samples;
+    long samples_per_symbol;
+    float phase;
+    bool valid;
+};
+
+#define FT8_GFSK_CONST_K 5.336446f
+#define FT8_GFSK_BT 2.0f
+
 struct tx_config {
     const char *mode;
     const char *audio_source;
     const char *audio_path;
     const char *cw_text;
+    const char *ft8_text;
     long sample_rate;
     long tone_hz;
     long audio_rate;
@@ -137,7 +157,87 @@ struct tx_state {
     float fm_phase;
     struct audio_state audio;
     struct cw_state cw;
+    struct ft8_state ft8;
 };
+
+static void ft8_init(struct ft8_state *state, const char *text, long sample_rate)
+{
+    ftx_message_t message;
+    struct timespec now;
+    long long utc_samples;
+
+    memset(state, 0, sizeof(*state));
+    if (ftx_message_encode(&message, NULL, text) != FTX_MESSAGE_RC_OK)
+        return;
+    ft8_encode(message.payload, state->tones);
+    state->samples_per_symbol = (long)(FT8_SYMBOL_PERIOD * (float)sample_rate + 0.5f);
+    state->pulse = malloc((size_t)(3 * state->samples_per_symbol) * sizeof(*state->pulse));
+    if (!state->pulse)
+        return;
+    for (long i = 0; i < 3 * state->samples_per_symbol; i++) {
+        float t = (float)i / (float)state->samples_per_symbol - 1.5f;
+        float arg1 = FT8_GFSK_CONST_K * FT8_GFSK_BT * (t + 0.5f);
+        float arg2 = FT8_GFSK_CONST_K * FT8_GFSK_BT * (t - 0.5f);
+        state->pulse[i] = (erff(arg1) - erff(arg2)) * 0.5f;
+    }
+    state->signal_samples = FT8_NN * state->samples_per_symbol;
+    state->slot_samples = 15L * sample_rate;
+    state->signal_start_sample = (state->slot_samples - state->signal_samples) / 2;
+    clock_gettime(CLOCK_REALTIME, &now);
+    utc_samples = (long long)now.tv_sec * sample_rate +
+        ((long long)now.tv_nsec * sample_rate) / 1000000000LL;
+    state->slot_sample = (long)(utc_samples % state->slot_samples);
+    state->valid = true;
+}
+
+static void ft8_next_iq(struct ft8_state *state, long sample_rate, float level,
+                        float base_frequency_hz, float *i_val, float *q_val)
+{
+    long signal_sample = state->slot_sample - state->signal_start_sample;
+
+    *i_val = 0.0f;
+    *q_val = 0.0f;
+    if (state->valid && signal_sample >= 0 && signal_sample < state->signal_samples) {
+        long n = state->samples_per_symbol;
+        long x = signal_sample + n;
+        int last_symbol = (int)(x / n);
+        int first_symbol = last_symbol - 2;
+        float shaped_tone = 0.0f;
+        float envelope = 1.0f;
+        int symbol;
+
+        if (first_symbol < 0)
+            first_symbol = 0;
+        if (last_symbol >= FT8_NN)
+            last_symbol = FT8_NN - 1;
+        for (symbol = first_symbol; symbol <= last_symbol; symbol++) {
+            long pulse_index = x - (long)symbol * n;
+            if (pulse_index >= 0 && pulse_index < 3 * n)
+                shaped_tone += state->tones[symbol] * state->pulse[pulse_index];
+        }
+        if (x < 2 * n)
+            shaped_tone += state->tones[0] * state->pulse[x + n];
+        if (x >= state->signal_samples)
+            shaped_tone += state->tones[FT8_NN - 1] * state->pulse[x - state->signal_samples];
+        if (signal_sample < n / 8)
+            envelope = (1.0f - cosf((float)M_PI * signal_sample / (float)(n / 8))) * 0.5f;
+        else if (signal_sample >= state->signal_samples - n / 8) {
+            long remaining = state->signal_samples - 1 - signal_sample;
+            envelope = (1.0f - cosf((float)M_PI * remaining / (float)(n / 8))) * 0.5f;
+        }
+        *i_val = cosf(state->phase) * level * envelope;
+        *q_val = sinf(state->phase) * level * envelope;
+        state->phase += 2.0f * (float)M_PI * base_frequency_hz / (float)sample_rate +
+            2.0f * (float)M_PI * shaped_tone / (float)n;
+        if (state->phase > 2.0f * (float)M_PI)
+            state->phase -= 2.0f * (float)M_PI;
+    }
+    state->slot_sample++;
+    if (state->slot_sample >= state->slot_samples) {
+        state->slot_sample = 0;
+        state->phase = 0.0f;
+    }
+}
 
 struct tone_metric {
     double i;
@@ -878,6 +978,9 @@ static void fill_tx_modulated(struct iio_buffer *buf, struct iio_channel *i_chan
         } else if (mode_is(cfg->mode, "cw")) {
             if (cw_next_key(&state->cw))
                 i_val = level;
+        } else if (mode_is(cfg->mode, "ft8")) {
+            ft8_next_iq(&state->ft8, cfg->sample_rate, level,
+                        (float)cfg->audio_tone_hz, &i_val, &q_val);
         } else {
             i_val = cosf(state->tone_phase) * level;
             q_val = sinf(state->tone_phase) * level;
@@ -978,6 +1081,7 @@ static int run_loopback(void)
         .audio_source = env_default("PLUTO_TX_AUDIO_SOURCE", "tone"),
         .audio_path = env_default("PLUTO_TX_AUDIO_PATH", ""),
         .cw_text = env_default("PLUTO_TX_CW_TEXT", "CQ PLUTO"),
+        .ft8_text = env_default("PLUTO_TX_FT8_TEXT", "CQ K1ABC FN42"),
         .sample_rate = sample_rate,
         .tone_hz = tone_hz,
         .audio_rate = env_long("PLUTO_TX_AUDIO_RATE_HZ", 8000, 8000, 48000),
@@ -1007,6 +1111,11 @@ static int run_loopback(void)
 
     memset(&tx_state, 0, sizeof(tx_state));
     build_cw_units(&tx_state.cw, tx_cfg.cw_text, sample_rate, tx_cfg.cw_wpm);
+    ft8_init(&tx_state.ft8, tx_cfg.ft8_text, sample_rate);
+    if (mode_is(tx_cfg.mode, "ft8") && !tx_state.ft8.valid) {
+        fprintf(stderr, "could not encode FT8 message: %s\n", tx_cfg.ft8_text);
+        goto out;
+    }
     if (audio_open(&tx_state.audio, &tx_cfg) < 0)
         goto out;
     demod_metrics_init(&demod, tx_cfg.mode, sample_rate, expect_tone_hz, carrier_offset_hz);
@@ -1102,6 +1211,7 @@ out:
         iio_buffer_destroy(rx_buf);
     if (tx_state.audio.file)
         fclose(tx_state.audio.file);
+    free(tx_state.ft8.pulse);
     if (ctx)
         iio_context_destroy(ctx);
 

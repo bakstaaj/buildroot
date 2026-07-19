@@ -59,11 +59,11 @@ RADIO_NAME = "ad9361-phy"
 PROFILE_RE = re.compile(r"^[A-Z0-9_.-]+$")
 CAPTURE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 GAIN_MODES = {"manual", "slow_attack", "fast_attack", "hybrid"}
-AUDIO_DEMODES = {"nfm", "wfm", "am", "cw"}
+AUDIO_DEMODES = {"nfm", "wfm", "am", "cw", "ft8"}
 AUDIO_AGC_MODES = {"manual", "off", "slow_attack", "fast_attack", "normalize"}
 DEEMPHASIS_MODES = {"none", "50us", "75us"}
 IQ_MODES = {"normal", "swap", "invert_i", "invert_q", "conjugate", "invert_both", "swap_invert_i", "swap_invert_q", "swap_invert_both"}
-TX_MODES = {"tone", "carrier", "am", "fm", "cw"}
+TX_MODES = {"tone", "carrier", "am", "fm", "cw", "ft8"}
 TX_AUDIO_SOURCES = {"tone", "file"}
 TX_AUDIO_SAFE_ROOTS = ("/mnt/jffs2/", "/media/", "/tmp/", "/var/run/")
 MIN_AD9361_SAMPLE_RATE_HZ = 520_833
@@ -275,6 +275,7 @@ DEMOSAFE_FIELDS = {
     "tx_fm_deviation_hz",
     "tx_cw_text",
     "tx_cw_wpm",
+    "tx_ft8_text",
 }
 
 
@@ -409,6 +410,7 @@ def stopped_audio_updates(**updates):
         "backend": None,
         "controls": {},
         "cw_decode": None,
+        "ft8_decode": None,
         "demod_mode": None,
         "fifo_path": str(AUDIO_FIFO),
         "fm_channel_filter": None,
@@ -634,6 +636,15 @@ def validate_cw_text(value):
     return text
 
 
+def validate_ft8_text(value):
+    if not isinstance(value, str):
+        raise ApiError("invalid_value", "tx_ft8_text must be text", details={"tx_ft8_text": value})
+    text = value.strip().upper()
+    if not text or len(text) > 35 or any(ord(ch) < 32 or ord(ch) > 126 for ch in text):
+        raise ApiError("invalid_value", "tx_ft8_text must contain 1 to 35 printable ASCII characters")
+    return text
+
+
 def validate_optional_decimal(payload, key, default, min_value, max_value):
     if key not in payload:
         return default
@@ -733,6 +744,7 @@ def clean_profile(profile, source):
     )
     cleaned["tx_cw_text"] = validate_cw_text(cleaned.get("tx_cw_text", "CQ PLUTO"))
     cleaned["tx_cw_wpm"] = validate_uint(cleaned.get("tx_cw_wpm", 12), "tx_cw_wpm", 5, 40)
+    cleaned["tx_ft8_text"] = validate_ft8_text(cleaned.get("tx_ft8_text", "CQ K1ABC FN42"))
     cleaned["tx_duration_limit_seconds"] = validate_uint(
         cleaned.get("tx_duration_limit_seconds", 0),
         "tx_duration_limit_seconds",
@@ -897,6 +909,9 @@ def apply_profile_fir_mode(device, profile):
         rf_bandwidth = int(profile.get("rf_bandwidth_hz") or 0)
         if sample_rate == 520999 and rf_bandwidth == 521000:
             writes.append(write_attr(device, "filter_fir_config", AD9361_FIR_521K_CONFIG, required=True))
+    if dry_run():
+        writes.append(write_attr(device, "in_out_voltage_filter_fir_en", enabled, required=False))
+        return writes
     current = read_attr(device, "in_out_voltage_filter_fir_en")
     if current == enabled:
         writes.append({"attr": "in_out_voltage_filter_fir_en", "value": enabled, "status": "unchanged"})
@@ -1316,6 +1331,7 @@ def merge_audio_backend_report(state, report):
         "fm_channel_filter",
         "fm_limiter",
         "cw_decode",
+        "ft8_decode",
         "iq_mode",
         "iq_decimation",
         "last_error",
@@ -1396,6 +1412,7 @@ def audio_status():
             "fm_channel_filter": state.get("fm_channel_filter"),
             "fm_limiter": state.get("fm_limiter"),
             "cw_decode": state.get("cw_decode"),
+            "ft8_decode": state.get("ft8_decode"),
             "iq_mode": state.get("iq_mode"),
             "processing_sample_rate_hz": state.get("processing_sample_rate_hz"),
             "iq_decimation": state.get("iq_decimation"),
@@ -2479,11 +2496,11 @@ def validate_tx(payload):
     tx_mode = payload.get("tx_mode", profile.get("tx_mode", "tone"))
     if tx_mode not in TX_MODES:
         raise ApiError("invalid_value", "tx_mode is invalid", details={"tx_mode": tx_mode})
-    default_tone = 0 if tx_mode in {"carrier", "am", "fm", "cw"} else profile.get("tx_tone_hz", 10000)
+    default_tone = 0 if tx_mode in {"carrier", "am", "fm", "cw", "ft8"} else profile.get("tx_tone_hz", 10000)
     tx_tone_hz = validate_uint(payload.get("tx_tone_hz", default_tone), "tx_tone_hz", 0, 200000)
     if tx_mode == "tone" and tx_tone_hz < 100:
         raise ApiError("invalid_tx_tone", "tone TX requires tx_tone_hz >= 100", details={"tx_tone_hz": tx_tone_hz})
-    if tx_mode in {"carrier", "am", "fm", "cw"}:
+    if tx_mode in {"carrier", "am", "fm", "cw", "ft8"}:
         tx_tone_hz = 0
     tx_audio_source = payload.get("tx_audio_source", profile.get("tx_audio_source", "tone"))
     if tx_audio_source not in TX_AUDIO_SOURCES:
@@ -2510,6 +2527,7 @@ def validate_tx(payload):
     )
     tx_cw_text = validate_cw_text(payload.get("tx_cw_text", profile.get("tx_cw_text", "CQ PLUTO")))
     tx_cw_wpm = validate_uint(payload.get("tx_cw_wpm", profile.get("tx_cw_wpm", 12)), "tx_cw_wpm", 5, 40)
+    tx_ft8_text = validate_ft8_text(payload.get("tx_ft8_text", profile.get("tx_ft8_text", "CQ K1ABC FN42")))
     tx_gain_db = validate_decimal(payload.get("tx_gain_db", profile.get("tx_gain_db", -30.0)), "tx_gain_db", -89.75, 0.0)
     tx_amplitude = validate_decimal(
         payload.get("tx_amplitude", profile.get("tx_amplitude", 0.05)),
@@ -2553,6 +2571,7 @@ def validate_tx(payload):
         "tx_fm_deviation_hz": tx_fm_deviation_hz,
         "tx_cw_text": tx_cw_text,
         "tx_cw_wpm": tx_cw_wpm,
+        "tx_ft8_text": tx_ft8_text,
         "sample_rate_hz": sample_rate_hz,
         "rf_bandwidth_hz": profile["rf_bandwidth_hz"],
         "gain_db": profile["gain_db"],
@@ -2573,6 +2592,7 @@ def tx_guardrail_bounds():
         "tx_am_modulation_index": {"min": 0.0, "max": 1.0},
         "tx_fm_deviation_hz": {"min": 100, "max": 25_000, "limit": "below sample_rate_hz / 8"},
         "tx_cw_wpm": {"min": 5, "max": 40},
+        "tx_ft8_text": {"max_chars": 35},
         "tx_cw_text": {"max_chars": 80, "allowed": "A-Z a-z 0-9 space . , ? / + -"},
         "tx_modes": sorted(TX_MODES),
         "tx_audio_sources": sorted(TX_AUDIO_SOURCES),
@@ -2598,6 +2618,7 @@ def tx_plan_summary(plan):
         "tx_fm_deviation_hz": plan["tx_fm_deviation_hz"],
         "tx_cw_text": plan["tx_cw_text"],
         "tx_cw_wpm": plan["tx_cw_wpm"],
+        "tx_ft8_text": plan["tx_ft8_text"],
         "sample_rate_hz": plan["sample_rate_hz"],
         "rf_bandwidth_hz": plan["rf_bandwidth_hz"],
     }
@@ -4016,6 +4037,169 @@ def start_loopback_cw(payload):
             pass
 
 
+def start_loopback_ft8(payload):
+    source_frequency_hz = validate_uint(payload.get("source_frequency_hz", 7_074_000), "source_frequency_hz", 1_000_000, 70_000_000)
+    translation_hz = validate_uint(payload.get("frequency_translation_hz", 125_000_000), "frequency_translation_hz", 0, 6_000_000_000)
+    hardware_frequency_hz = source_frequency_hz + translation_hz
+    if hardware_frequency_hz < 70_000_000 or hardware_frequency_hz > 6_000_000_000:
+        raise ApiError("invalid_frequency_translation", "translated FT8 frequency is outside the AD9361 tuning range")
+    attenuator_db = validate_decimal(payload.get("attenuator_db", 30), "attenuator_db", 30, 120)
+    if not tx_confirmation(payload):
+        raise ApiError("tx_confirmation_required", "set confirm_live_tx=true to run bounded live RF FT8 loopback", status=403)
+
+    rx_profile = get_profile(payload.get("rx_profile", "FT8_40M_LOOPBACK"))
+    demod, audio_rate = audio_capable_profile(rx_profile)
+    if demod != "ft8" or audio_rate != 12_000:
+        raise ApiError("invalid_rx_profile", "FT8 loopback requires a 12 kHz FT8 receive profile")
+    tx_payload = dict(payload)
+    tx_payload.update({
+        "profile": payload.get("tx_profile", "TX_FT8_LOOPBACK"),
+        "frequency_hz": hardware_frequency_hz,
+        "tx_mode": "ft8",
+    })
+    tx_payload.setdefault("duration_seconds", 30)
+    tx_payload.setdefault("tx_gain_db", -40)
+    tx_payload.setdefault("tx_amplitude", 0.05)
+    tx_payload.setdefault("tx_audio_tone_hz", 1500)
+    tx_payload.setdefault("tx_ft8_text", "CQ K1ABC FN42")
+    tx_plan = validate_tx(tx_payload)
+    if tx_plan["tx_mode"] != "ft8":
+        raise ApiError("invalid_tx_profile", "FT8 loopback requires FT8 TX")
+    capture_seconds = validate_uint(payload.get("capture_seconds", 32), "capture_seconds", 30, 35)
+    rx_gain_db = validate_decimal(payload.get("rx_gain_db", rx_profile.get("gain_db", 35)), "rx_gain_db")
+    rx_gain_mode = payload.get("rx_gain_control_mode", rx_profile.get("gain_control_mode", "manual"))
+    if rx_gain_mode not in GAIN_MODES:
+        raise ApiError("invalid_value", "rx_gain_control_mode is invalid")
+
+    common_state = {
+        "mode": "ft8",
+        "rx_profile": rx_profile["name"],
+        "tx_profile": tx_plan["profile"]["name"],
+        "source_frequency_hz": source_frequency_hz,
+        "frequency_translation_hz": translation_hz,
+        "rx_frequency_hz": hardware_frequency_hz,
+        "rx_lo_frequency_hz": hardware_frequency_hz,
+        "rx_if_offset_hz": 0,
+        "tx_frequency_hz": hardware_frequency_hz,
+        "attenuator_db": attenuator_db,
+        "cable_path": "TX1 -> 30 dB attenuator -> RX1",
+        "duration_seconds": tx_plan["duration_seconds"],
+        "capture_seconds": capture_seconds,
+        "tx_gain_db": tx_plan["tx_gain_db"],
+        "tx_amplitude": tx_plan["tx_amplitude"],
+        "tx_ft8_text": tx_plan["tx_ft8_text"],
+        "ft8_audio_frequency_hz": tx_plan["tx_audio_tone_hz"],
+    }
+    simulate = dry_run() or str(payload.get("simulate", "")).lower() in {"1", "true", "yes"}
+    if simulate:
+        metrics = {
+            "simulated": True,
+            "passed": True,
+            "pass_criteria": {"decoded_expected_message": True, "minimum_attenuator_db": 30},
+            "ft8_decode": {
+                "decode_supported": True,
+                "protocol": "FT8",
+                "slots_completed": 1,
+                "message_count": 1,
+                "messages": [{"time_offset_s": 1.18, "audio_frequency_hz": tx_plan["tx_audio_tone_hz"], "sync_score": 50, "text": tx_plan["tx_ft8_text"]}],
+            },
+        }
+        state = save_loopback_demod_state(state="complete", started_utc=now_utc(), completed_utc=now_utc(), metrics=metrics, last_error=None, **common_state)
+        return {"ok": True, "loopback_ft8": state, "bounded": True}
+
+    backend = tx_backend_path()
+    audio_backend = DEFAULT_AUDIO_BACKEND
+    if not backend.is_file() or not os.access(str(backend), os.X_OK):
+        raise ApiError("tx_backend_missing", f"TX backend is not installed: {backend}", status=503)
+    if not audio_backend.is_file() or not os.access(str(audio_backend), os.X_OK):
+        raise ApiError("audio_backend_missing", f"audio backend is not installed: {audio_backend}", status=503)
+
+    stop_audio()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if AUDIO_FIFO.exists() and not AUDIO_FIFO.is_fifo():
+        AUDIO_FIFO.unlink()
+    if not AUDIO_FIFO.exists():
+        os.mkfifo(str(AUDIO_FIFO), 0o600)
+    clear_audio_backend_status()
+    started_utc = now_utc()
+    running_state = save_loopback_demod_state(state="running", started_utc=started_utc, completed_utc=None, metrics=None, last_error=None, **common_state)
+    audio_proc = None
+    tx_proc = None
+    log = None
+    writes = []
+    try:
+        writes.extend(apply_profile({"profile": rx_profile["name"], "frequency_hz": hardware_frequency_hz, "gain_db": rx_gain_db, "gain_control_mode": rx_gain_mode}).get("writes", []))
+        writes.extend(ensure_rx_iq_scan_enabled())
+        controls = audio_controls(rx_profile, {"squelch_db": -120, "noise_gate_db": -120, "filter_width_hz": 3200, "output_gain": payload.get("output_gain", 1.0)})
+        env = os.environ.copy()
+        env.update({
+            "PLUTO_AUDIO_FIFO": str(AUDIO_FIFO), "PLUTO_AUDIO_STATE_FILE": str(AUDIO_STATE_FILE),
+            "PLUTO_AUDIO_BACKEND_STATUS_FILE": str(AUDIO_BACKEND_STATUS_FILE), "PLUTO_AUDIO_PROFILE": rx_profile["name"],
+            "PLUTO_AUDIO_STARTED_UTC": started_utc, "PLUTO_AUDIO_DEMOD": "ft8", "PLUTO_AUDIO_RATE_HZ": "12000",
+            "PLUTO_DSP_INPUT_RATE_HZ": str(rx_profile["sample_rate_hz"]), "PLUTO_DSP_FREQUENCY_SHIFT_HZ": "0",
+            "PLUTO_DSP_IQ_MODE": str(payload.get("iq_mode", rx_profile.get("iq_mode", "normal"))),
+            "PLUTO_AUDIO_FILTER_WIDTH_HZ": str(controls["filter_width_hz"]), "PLUTO_AUDIO_SQUELCH_DB": "-120",
+            "PLUTO_AUDIO_DEEMPHASIS": "none", "PLUTO_AUDIO_AGC": controls["agc"],
+            "PLUTO_AUDIO_OUTPUT_GAIN": str(controls["output_gain"]), "PLUTO_AUDIO_NOISE_GATE_DB": "-120",
+            "PLUTO_AUDIO_DC_BLOCK": "1", "PLUTO_AUDIO_STREAM_FORMAT": "pcm_s16le",
+            "PLUTO_AUDIO_BACKEND_KIND": "external", "PLUTO_AUDIO_BACKEND_PATH": str(audio_backend),
+        })
+        log = (STATE_DIR / "loopback-ft8.log").open("ab")
+        audio_proc = subprocess.Popen([str(audio_backend)], stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env)
+        target_bytes = capture_seconds * audio_rate * 2
+        writes.extend(apply_tx_hardware_only(tx_plan))
+        tx_env = os.environ.copy()
+        tx_env.update({
+            "PLUTO_TX_MODE": "ft8", "PLUTO_TX_ONLY": "1",
+            "PLUTO_LOOPBACK_DURATION_MS": str(tx_plan["duration_seconds"] * 1000),
+            "PLUTO_LOOPBACK_SAMPLE_RATE_HZ": str(tx_plan["sample_rate_hz"]),
+            "PLUTO_LOOPBACK_TX_AMPLITUDE": str(tx_plan["tx_amplitude"]),
+            "PLUTO_TX_AUDIO_TONE_HZ": str(tx_plan["tx_audio_tone_hz"]),
+            "PLUTO_TX_FT8_TEXT": tx_plan["tx_ft8_text"],
+        })
+        capture_thread, capture_result = start_fifo_capture(AUDIO_FIFO, target_bytes, capture_seconds + 5)
+        time.sleep(0.5)
+        tx_proc = subprocess.Popen([str(backend)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=tx_env)
+        capture_thread.join(timeout=capture_seconds + 6)
+        if capture_result["error"] is not None:
+            raise capture_result["error"]
+        require_bounded_pcm_capture(capture_result["pcm"], target_bytes, capture_seconds)
+        tx_stdout, tx_stderr = tx_proc.communicate(timeout=tx_plan["duration_seconds"] + 5)
+        if tx_proc.returncode != 0:
+            raise ApiError("tx_failed", (tx_stderr or "FT8 TX backend failed").strip(), status=503)
+        report = load_audio_backend_report(audio_proc.pid) or {}
+        ft8_decode = report.get("ft8_decode") or {}
+        decoded_texts = [item.get("text") for item in ft8_decode.get("messages", []) if isinstance(item, dict)]
+        passed = tx_plan["tx_ft8_text"] in decoded_texts
+        metrics = {"passed": passed, "pass_criteria": {"decoded_expected_message": True, "minimum_attenuator_db": 30}, "decoded_texts": decoded_texts, "ft8_decode": ft8_decode, "audio_backend": report, "tx_backend": json.loads(tx_stdout or "{}")}
+        state = save_loopback_demod_state(state="complete", completed_utc=now_utc(), metrics=metrics, last_error=None)
+        return {"ok": True, "loopback_ft8": state, "writes": writes, "bounded": True}
+    except Exception as exc:
+        if isinstance(exc, ApiError):
+            error = exc
+        else:
+            error = ApiError("loopback_ft8_failed", str(exc), status=503)
+        save_loopback_demod_state(state="error", mode="ft8", completed_utc=now_utc(), last_error={"code": error.code, "message": error.message, "time_utc": now_utc(), "details": error.details})
+        raise error
+    finally:
+        if tx_proc and tx_proc.poll() is None:
+            tx_proc.terminate()
+        if audio_proc and audio_proc.poll() is None:
+            audio_proc.terminate()
+            try:
+                audio_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                audio_proc.kill()
+        if log:
+            log.close()
+        clear_audio_backend_status()
+        save_audio_state(**stopped_audio_updates())
+        try:
+            write_attr(find_iio_device(), "ensm_mode", "alert")
+        except Exception:
+            pass
+
+
 def start_demod_self_test(payload):
     profile = get_profile(payload.get("profile", "NOAA_NFM"))
     demod, audio_rate = audio_capable_profile(profile)
@@ -5276,6 +5460,8 @@ def route(method, path, payload):
         return loopback_demod_status()
     if method == "GET" and path in {"/radio/loopback/cw/status", "/loopback/cw/status"}:
         return loopback_demod_status()
+    if method == "GET" and path in {"/radio/loopback/ft8/status", "/loopback/ft8/status"}:
+        return loopback_demod_status()
     if method == "GET" and path in {"/radio/tx/status", "/tx/status"}:
         return tx_status()
     if method == "GET" and path in {"/radio/tx/guardrails", "/tx/guardrails"}:
@@ -5318,6 +5504,8 @@ def route(method, path, payload):
         return start_loopback_demod(payload)
     if method == "POST" and path in {"/radio/loopback/cw", "/loopback/cw"}:
         return start_loopback_cw(payload)
+    if method == "POST" and path in {"/radio/loopback/ft8", "/loopback/ft8"}:
+        return start_loopback_ft8(payload)
     if method == "POST" and path in {"/radio/tx/start", "/tx/start"}:
         return start_tx(payload)
     if method == "POST" and path in {"/radio/tx/stop", "/tx/stop"}:
@@ -5343,7 +5531,7 @@ def route(method, path, payload):
 
 def run_cli(argv):
     if len(argv) < 2:
-        raise ApiError("usage", "usage: pluto-radio-api serve|status|health|logs|profiles|apply|tune|stop|audio-start|audio-stop|audio-status|demod-self-test|watchdog-status|watchdog-check|capture-start|capture-list|capture-delete|spectrum-status|spectrum-snapshot|spectrum-top|spectrum-stream|loopback-status|loopback-start|loopback-demod-status|loopback-demod|loopback-cw-status|loopback-cw|tx-status|tx-guardrails|tx-start|tx-stop|calibration-status|calibration-apply|calibration-measure|self-test|self-test-status|doppler-status|doppler-plan|doppler-start|doppler-stop|doppler-tick", status=2)
+        raise ApiError("usage", "usage: pluto-radio-api serve|status|health|logs|profiles|apply|tune|stop|audio-start|audio-stop|audio-status|demod-self-test|watchdog-status|watchdog-check|capture-start|capture-list|capture-delete|spectrum-status|spectrum-snapshot|spectrum-top|spectrum-stream|loopback-status|loopback-start|loopback-demod-status|loopback-demod|loopback-cw-status|loopback-cw|loopback-ft8-status|loopback-ft8|tx-status|tx-guardrails|tx-start|tx-stop|calibration-status|calibration-apply|calibration-measure|self-test|self-test-status|doppler-status|doppler-plan|doppler-start|doppler-stop|doppler-tick", status=2)
     command = argv[1]
     if command == "serve":
         run_http_server(argv)
@@ -5484,6 +5672,19 @@ def run_cli(argv):
                 key, value = arg.split("=", 1)
                 payload[key] = value
         return start_loopback_cw(payload)
+    if command == "loopback-ft8-status":
+        return loopback_demod_status()
+    if command == "loopback-ft8":
+        payload = {}
+        for arg in argv[2:]:
+            if arg == "--simulate":
+                payload["simulate"] = "true"
+            elif arg == "--confirm-live-tx":
+                payload["confirm_live_tx"] = "true"
+            elif "=" in arg:
+                key, value = arg.split("=", 1)
+                payload[key] = value
+        return start_loopback_ft8(payload)
     if command == "tx-status":
         return tx_status()
     if command == "tx-guardrails":

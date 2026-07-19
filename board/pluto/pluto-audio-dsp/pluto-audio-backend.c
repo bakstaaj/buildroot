@@ -17,6 +17,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "pluto-ft8-decoder.h"
+
 #define DEFAULT_DEVICE "cf-ad9361-lpc"
 #define DEFAULT_I_CHAN "voltage0"
 #define DEFAULT_Q_CHAN "voltage1"
@@ -36,6 +38,7 @@ enum demod_mode {
     DEMOD_WFM,
     DEMOD_AM,
     DEMOD_CW,
+    DEMOD_FT8,
 };
 
 enum agc_mode {
@@ -149,6 +152,7 @@ struct dsp_state {
     int64_t i_acc;
     int64_t q_acc;
     struct cw_live_decoder cw_live;
+    struct pluto_ft8_decoder *ft8;
 };
 
 static void handle_signal(int signo)
@@ -644,6 +648,9 @@ static void write_audio_running_report(struct dsp_state *dsp)
     } else {
         fprintf(out, "  \"cw_decode\": null,\n");
     }
+    fprintf(out, "  \"ft8_decode\": ");
+    pluto_ft8_decoder_write_json(dsp->ft8, out);
+    fputs(",\n", out);
     json_string_field(out, "started_utc", getenv("PLUTO_AUDIO_STARTED_UTC"), true);
     json_string_field(out, "state", "running", true);
     json_string_field(out, "stream_format", env_default("PLUTO_AUDIO_STREAM_FORMAT", "pcm_s16le"), true);
@@ -700,6 +707,8 @@ static enum demod_mode parse_demod(const char *value)
         return DEMOD_AM;
     if (!strcmp(value, "cw"))
         return DEMOD_CW;
+    if (!strcmp(value, "ft8"))
+        return DEMOD_FT8;
     return DEMOD_NFM;
 }
 
@@ -881,6 +890,8 @@ static void dsp_init(struct dsp_state *dsp, enum demod_mode mode, long input_rat
     dsp->agc_attack = agc == AGC_FAST ? 0.020f : 0.004f;
     dsp->agc_release = agc == AGC_FAST ? 0.004f : 0.001f;
     cw_live_init(&dsp->cw_live, mode, dsp->audio_rate);
+    if (mode == DEMOD_FT8)
+        dsp->ft8 = pluto_ft8_decoder_create(dsp->audio_rate);
 
     if (mode == DEMOD_WFM) {
         dsp->scale = 15500.0f;
@@ -889,6 +900,8 @@ static void dsp_init(struct dsp_state *dsp, enum demod_mode mode, long input_rat
         dsp->scale = 10500.0f;
         dsp->alpha = 0.12f;
     } else if (mode == DEMOD_CW) {
+        dsp->scale = 24000.0f;
+    } else if (mode == DEMOD_FT8) {
         dsp->scale = 24000.0f;
         dsp->alpha = 0.04f;
     } else {
@@ -901,7 +914,8 @@ static void dsp_init(struct dsp_state *dsp, enum demod_mode mode, long input_rat
 
 static void dsp_destroy(struct dsp_state *dsp)
 {
-    (void)dsp;
+    pluto_ft8_decoder_destroy(dsp->ft8);
+    dsp->ft8 = NULL;
 }
 
 static int dsp_emit(struct dsp_state *dsp, FILE *sink, float sample)
@@ -955,6 +969,7 @@ static int dsp_emit(struct dsp_state *dsp, FILE *sink, float sample)
     if (dsp->noise_gate_enabled && dbfs(fabsf(audio) / INT16_CLIP) < dsp->noise_gate_threshold_db)
         audio = 0.0f;
     cw_live_add_audio(&dsp->cw_live, audio);
+    pluto_ft8_decoder_add_audio(dsp->ft8, audio);
     int16_t pcm = clamp_pcm(audio);
     if (write_pcm(sink, pcm) < 0)
         return -1;
@@ -1081,6 +1096,13 @@ static int dsp_process_iq(struct dsp_state *dsp, FILE *sink, int16_t i_raw, int1
         dsp->prev_q = q_val;
         dsp->have_prev_iq = true;
         sample *= dsp->scale;
+    } else if (dsp->mode == DEMOD_FT8) {
+        /*
+         * The Pluto is tuned to the FT8 dial frequency, so positive complex
+         * baseband is the USB audio passband. Taking I produces the real
+         * audio waveform after the existing channel filter/decimator.
+         */
+        sample = i_val * dsp->scale;
     } else {
         dsp->am_avg += (mag - dsp->am_avg) * 0.0015f;
         if (dsp->mode == DEMOD_CW)

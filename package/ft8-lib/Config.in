@@ -1,0 +1,9 @@
+config BR2_PACKAGE_FT8_LIB
+	bool "ft8-lib"
+	help
+	  Lightweight C FT8/FT4 encoder and decoder library designed for
+	  resource-constrained systems. This package installs a static library
+	  and headers for firmware applications; it does not install the
+	  upstream desktop demo programs.
+
+	  https://github.com/kgoba/ft8_lib
