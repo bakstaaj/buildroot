@@ -2919,6 +2919,10 @@ def apply_tx_config(plan):
 
 
 def simulated_tx_metrics(plan):
+    sample_count = max(1, int(plan["duration_seconds"] * plan["sample_rate_hz"]))
+    push_count = max(1, math.ceil(sample_count / 4096))
+    tx_amplitude = max(float(plan["tx_amplitude"]), 1.0e-9)
+    tx_level_dbfs = round(20.0 * math.log10(tx_amplitude), 2)
     return {
         "ok": True,
         "mode": "tx_only",
@@ -2935,8 +2939,33 @@ def simulated_tx_metrics(plan):
         "tx_fm_deviation_hz": plan["tx_fm_deviation_hz"],
         "tx_cw_text": plan["tx_cw_text"],
         "tx_cw_wpm": plan["tx_cw_wpm"],
+        "tx_push_count": push_count,
+        "tx_sample_count": sample_count,
+        "tx_transition_count": max(0, sample_count - 1),
+        "tx_rms_dbfs": tx_level_dbfs,
+        "tx_peak_dbfs": tx_level_dbfs,
         "simulated": True,
     }
+
+
+def validate_tx_backend_metrics(metrics):
+    if not isinstance(metrics, dict):
+        raise ApiError("tx_backend_metrics", "TX backend did not return a JSON object", status=503)
+    if metrics.get("ok") is False:
+        message = metrics.get("error") or metrics.get("message") or "TX backend reported failure"
+        raise ApiError("tx_backend_failed", str(message), status=503, details=metrics)
+    if metrics.get("mode") != "tx_only":
+        return
+    try:
+        push_count = int(metrics.get("tx_push_count") or 0)
+        sample_count = int(metrics.get("tx_sample_count") or 0)
+        peak_dbfs = float(metrics.get("tx_peak_dbfs", -180.0))
+    except (TypeError, ValueError) as exc:
+        raise ApiError("tx_backend_metrics", str(exc), status=503, details=metrics)
+    if push_count <= 0 or sample_count <= 0:
+        raise ApiError("tx_backend_no_samples", "TX backend generated no IQ samples", status=503, details=metrics)
+    if peak_dbfs <= -120.0:
+        raise ApiError("tx_backend_zero_iq", "TX backend generated silent IQ samples", status=503, details=metrics)
 
 
 def start_tx(payload):
@@ -2976,6 +3005,7 @@ def start_tx(payload):
 
     if simulate:
         metrics = simulated_tx_metrics(plan)
+        validate_tx_backend_metrics(metrics)
         writes = [{"status": "dry_run" if dry_run() else "simulated"}]
     else:
         backend = tx_backend_path()
@@ -3036,6 +3066,14 @@ def start_tx(payload):
             metrics = json.loads(proc.stdout or "{}")
         except json.JSONDecodeError as exc:
             raise ApiError("tx_backend_json", str(exc), status=503)
+        try:
+            validate_tx_backend_metrics(metrics)
+        except ApiError as exc:
+            save_tx_state(
+                state="error",
+                last_error={"code": exc.code, "message": exc.message, "time_utc": now_utc()},
+            )
+            raise
 
     completed = save_tx_state(
         state="complete",

@@ -160,6 +160,16 @@ struct tx_state {
     struct ft8_state ft8;
 };
 
+struct tx_output_metrics {
+    unsigned long long sample_count;
+    unsigned long long transition_count;
+    bool have_last;
+    int16_t last_i;
+    int16_t last_q;
+    double sumsq;
+    double peak;
+};
+
 static void ft8_init(struct ft8_state *state, const char *text, long sample_rate)
 {
     ftx_message_t message;
@@ -945,8 +955,34 @@ static float audio_next_sample(struct audio_state *audio, const struct tx_config
     return sample;
 }
 
+static void tx_output_metrics_add(struct tx_output_metrics *metrics, int16_t i_val, int16_t q_val)
+{
+    double i_norm;
+    double q_norm;
+    double mag2;
+    double mag;
+
+    if (!metrics)
+        return;
+    if (metrics->have_last && (i_val != metrics->last_i || q_val != metrics->last_q))
+        metrics->transition_count++;
+    metrics->have_last = true;
+    metrics->last_i = i_val;
+    metrics->last_q = q_val;
+
+    i_norm = (double)i_val / 32768.0;
+    q_norm = (double)q_val / 32768.0;
+    mag2 = i_norm * i_norm + q_norm * q_norm;
+    mag = sqrt(mag2);
+    metrics->sumsq += mag2;
+    if (mag > metrics->peak)
+        metrics->peak = mag;
+    metrics->sample_count++;
+}
+
 static void fill_tx_modulated(struct iio_buffer *buf, struct iio_channel *i_chan,
-                              const struct tx_config *cfg, struct tx_state *state)
+                              const struct tx_config *cfg, struct tx_state *state,
+                              struct tx_output_metrics *metrics)
 {
     char *ptr = iio_buffer_first(buf, i_chan);
     char *end = iio_buffer_end(buf);
@@ -991,6 +1027,7 @@ static void fill_tx_modulated(struct iio_buffer *buf, struct iio_channel *i_chan
 
         sample[0] = clamp16(i_val);
         sample[1] = clamp16(q_val);
+        tx_output_metrics_add(metrics, sample[0], sample[1]);
     }
 }
 
@@ -1107,9 +1144,12 @@ static int run_loopback(void)
     unsigned long long samples = 0;
     struct demod_metrics demod;
     struct cw_decode_metrics cw_decode;
+    struct tx_output_metrics tx_metrics;
+    unsigned long long tx_push_count = 0;
     int ret = 1;
 
     memset(&tx_state, 0, sizeof(tx_state));
+    memset(&tx_metrics, 0, sizeof(tx_metrics));
     build_cw_units(&tx_state.cw, tx_cfg.cw_text, sample_rate, tx_cfg.cw_wpm);
     ft8_init(&tx_state.ft8, tx_cfg.ft8_text, sample_rate);
     if (mode_is(tx_cfg.mode, "ft8") && !tx_state.ft8.valid) {
@@ -1152,11 +1192,12 @@ static int run_loopback(void)
     if (mode_is(tx_cfg.mode, "loopback"))
         fill_tx_tone(tx_buf, tx_i, sample_rate, tone_hz, amplitude);
     else
-        fill_tx_modulated(tx_buf, tx_i, &tx_cfg, &tx_state);
+        fill_tx_modulated(tx_buf, tx_i, &tx_cfg, &tx_state, &tx_metrics);
     if (iio_buffer_push(tx_buf) < 0) {
         fprintf(stderr, "TX buffer push failed\n");
         goto out;
     }
+    tx_push_count++;
 
     started = monotonic_seconds();
     while (keep_running && ((monotonic_seconds() - started) * 1000.0) < (double)duration_ms) {
@@ -1166,19 +1207,21 @@ static int run_loopback(void)
         ptrdiff_t step;
 
         if (tx_only) {
-            fill_tx_modulated(tx_buf, tx_i, &tx_cfg, &tx_state);
+            fill_tx_modulated(tx_buf, tx_i, &tx_cfg, &tx_state, &tx_metrics);
             if (iio_buffer_push(tx_buf) < 0) {
                 fprintf(stderr, "TX buffer push failed\n");
                 goto out;
             }
+            tx_push_count++;
             continue;
         }
         if (!mode_is(tx_cfg.mode, "loopback"))
-            fill_tx_modulated(tx_buf, tx_i, &tx_cfg, &tx_state);
+            fill_tx_modulated(tx_buf, tx_i, &tx_cfg, &tx_state, &tx_metrics);
         if (iio_buffer_push(tx_buf) < 0) {
             fprintf(stderr, "TX buffer push failed\n");
             goto out;
         }
+        tx_push_count++;
         refill = iio_buffer_refill(rx_buf);
         if (refill < 0) {
             fprintf(stderr, "RX buffer refill failed: %zd\n", refill);
@@ -1200,6 +1243,11 @@ static int run_loopback(void)
             cw_decode_add(&cw_decode, i_val, q_val, samples);
             samples++;
         }
+    }
+
+    if (tx_only && (tx_push_count == 0 || tx_metrics.sample_count == 0 || tx_metrics.peak <= 0.0)) {
+        fprintf(stderr, "TX backend generated no non-zero IQ samples\n");
+        goto out;
     }
 
     ret = 0;
@@ -1281,16 +1329,25 @@ out:
                    amplitude, rms_dbfs, peak_dbfs);
         }
     } else if (ret == 0) {
+        double tx_rms = sqrt(tx_metrics.sumsq / (double)tx_metrics.sample_count);
+        double tx_rms_dbfs = 20.0 * log10(tx_rms > 1.0e-9 ? tx_rms : 1.0e-9);
+        double tx_peak_dbfs = 20.0 * log10(tx_metrics.peak > 1.0e-9 ? tx_metrics.peak : 1.0e-9);
+
         printf("{\"ok\":true,\"mode\":\"tx_only\",\"tx_mode\":\"%s\",\"duration_ms\":%ld,"
                "\"sample_rate_hz\":%ld,\"tone_hz\":%ld,"
                "\"tx_amplitude\":%.6f,\"audio_source\":\"%s\","
                "\"audio_rate_hz\":%ld,\"audio_tone_hz\":%ld,"
                "\"fm_deviation_hz\":%ld,\"am_modulation_index\":%.3f,"
-               "\"cw_wpm\":%ld}\n",
+               "\"cw_wpm\":%ld,"
+               "\"tx_push_count\":%llu,\"tx_sample_count\":%llu,"
+               "\"tx_transition_count\":%llu,\"tx_rms_dbfs\":%.2f,"
+               "\"tx_peak_dbfs\":%.2f}\n",
                tx_cfg.mode, duration_ms, sample_rate, tone_hz,
                amplitude, tx_cfg.audio_source, tx_cfg.audio_rate,
                tx_cfg.audio_tone_hz, tx_cfg.fm_deviation_hz,
-               tx_cfg.am_modulation_index, tx_cfg.cw_wpm);
+               tx_cfg.am_modulation_index, tx_cfg.cw_wpm,
+               tx_push_count, tx_metrics.sample_count,
+               tx_metrics.transition_count, tx_rms_dbfs, tx_peak_dbfs);
     }
     return ret;
 }

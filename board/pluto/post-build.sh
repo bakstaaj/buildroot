@@ -48,6 +48,7 @@ rm -f ${TARGET_DIR}/etc/init.d/S99iiod
 rm -Rf ${TARGET_DIR}/etc/dropbear
 
 mkdir -p ${TARGET_DIR}/www/img
+rm -rf ${TARGET_DIR}/etc/pluto-radio/profiles
 mkdir -p ${TARGET_DIR}/etc/pluto-radio/profiles
 mkdir -p ${TARGET_DIR}/etc/wpa_supplicant/
 mkdir -p ${TARGET_DIR}/mnt/jffs2
