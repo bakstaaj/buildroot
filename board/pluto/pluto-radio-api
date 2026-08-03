@@ -2513,9 +2513,10 @@ def validate_tx(payload):
     tx_audio_rate_hz = validate_uint(
         payload.get("tx_audio_rate_hz", profile.get("tx_audio_rate_hz", 8000)), "tx_audio_rate_hz", 8000, 48000
     )
-    tx_audio_tone_hz = validate_uint(
-        payload.get("tx_audio_tone_hz", profile.get("tx_audio_tone_hz", 1000)), "tx_audio_tone_hz", 20, 3000
-    )
+    tx_audio_tone_value = payload.get("tx_audio_tone_hz", profile.get("tx_audio_tone_hz", 1000))
+    if tx_mode in {"am", "fm"} and "tx_audio_tone_hz" not in payload and "tx_tone_hz" in payload:
+        tx_audio_tone_value = payload["tx_tone_hz"]
+    tx_audio_tone_hz = validate_uint(tx_audio_tone_value, "tx_audio_tone_hz", 20, 3000)
     tx_am_modulation_index = validate_decimal(
         payload.get("tx_am_modulation_index", profile.get("tx_am_modulation_index", 0.8)),
         "tx_am_modulation_index",
@@ -2923,6 +2924,10 @@ def simulated_tx_metrics(plan):
     push_count = max(1, math.ceil(sample_count / 4096))
     tx_amplitude = max(float(plan["tx_amplitude"]), 1.0e-9)
     tx_level_dbfs = round(20.0 * math.log10(tx_amplitude), 2)
+    audio_sample_count = sample_count if plan["tx_mode"] in {"am", "fm"} else 0
+    audio_file_samples_read = 0
+    if plan["tx_audio_source"] == "file" and plan["tx_audio_rate_hz"] > 0:
+        audio_file_samples_read = max(1, int(plan["duration_seconds"] * plan["tx_audio_rate_hz"]))
     return {
         "ok": True,
         "mode": "tx_only",
@@ -2944,6 +2949,20 @@ def simulated_tx_metrics(plan):
         "tx_transition_count": max(0, sample_count - 1),
         "tx_rms_dbfs": tx_level_dbfs,
         "tx_peak_dbfs": tx_level_dbfs,
+        "tx_audio_sample_count": audio_sample_count,
+        "tx_audio_crossing_count": int(plan["duration_seconds"] * plan["tx_audio_tone_hz"])
+        if plan["tx_mode"] in {"am", "fm"} and plan["tx_audio_source"] != "file"
+        else 0,
+        "tx_audio_rms": 0.707106781 if plan["tx_mode"] in {"am", "fm"} and plan["tx_audio_source"] != "file" else 0.0,
+        "tx_audio_peak": 1.0 if plan["tx_mode"] in {"am", "fm"} and plan["tx_audio_source"] != "file" else 0.0,
+        "tx_audio_file_samples_read": audio_file_samples_read,
+        "tx_audio_file_rewinds": 0,
+        "tx_measured_audio_tone_hz": plan["tx_audio_tone_hz"]
+        if plan["tx_mode"] in {"am", "fm"} and plan["tx_audio_source"] != "file"
+        else None,
+        "tx_audio_tone_error_hz": 0.0
+        if plan["tx_mode"] in {"am", "fm"} and plan["tx_audio_source"] != "file"
+        else None,
         "simulated": True,
     }
 
@@ -2966,6 +2985,34 @@ def validate_tx_backend_metrics(metrics):
         raise ApiError("tx_backend_no_samples", "TX backend generated no IQ samples", status=503, details=metrics)
     if peak_dbfs <= -120.0:
         raise ApiError("tx_backend_zero_iq", "TX backend generated silent IQ samples", status=503, details=metrics)
+    tx_mode = str(metrics.get("tx_mode") or "")
+    audio_source = str(metrics.get("tx_audio_source") or metrics.get("audio_source") or "")
+    if tx_mode in {"am", "fm"} and audio_source == "file":
+        try:
+            file_samples = int(metrics.get("tx_audio_file_samples_read") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ApiError("tx_backend_audio_metrics", str(exc), status=503, details=metrics)
+        if file_samples <= 0:
+            raise ApiError("tx_backend_audio_file_empty", "TX backend did not read PCM samples", status=503, details=metrics)
+    if tx_mode in {"am", "fm"} and audio_source != "file":
+        try:
+            requested_audio_hz = float(metrics.get("tx_audio_tone_hz") or metrics.get("audio_tone_hz") or 0.0)
+            measured_audio_hz = float(metrics.get("tx_measured_audio_tone_hz") or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise ApiError("tx_backend_audio_metrics", str(exc), status=503, details=metrics)
+        allowed_error_hz = max(5.0, requested_audio_hz * 0.02)
+        if requested_audio_hz > 0.0 and abs(measured_audio_hz - requested_audio_hz) > allowed_error_hz:
+            raise ApiError(
+                "tx_backend_audio_tone_mismatch",
+                "TX backend generated audio tone does not match request",
+                status=503,
+                details={
+                    "requested_audio_tone_hz": requested_audio_hz,
+                    "measured_audio_tone_hz": measured_audio_hz,
+                    "allowed_error_hz": allowed_error_hz,
+                    "metrics": metrics,
+                },
+            )
 
 
 def start_tx(payload):

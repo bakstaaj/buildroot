@@ -111,6 +111,8 @@ struct audio_state {
     float current;
     float file_accum;
     float tone_phase;
+    unsigned long long samples_read;
+    unsigned long long eof_rewinds;
 };
 
 struct cw_state {
@@ -163,6 +165,12 @@ struct tx_state {
 struct tx_output_metrics {
     unsigned long long sample_count;
     unsigned long long transition_count;
+    unsigned long long audio_sample_count;
+    unsigned long long audio_crossing_count;
+    bool audio_have_last;
+    float audio_last;
+    double audio_sumsq;
+    double audio_peak;
     bool have_last;
     int16_t last_i;
     int16_t last_q;
@@ -928,10 +936,12 @@ static float audio_read_file_sample(struct audio_state *audio)
     if (fread(raw, 1, sizeof(raw), audio->file) != sizeof(raw)) {
         if (!audio->file_repeat || fseek(audio->file, 0, SEEK_SET) != 0)
             return 0.0f;
+        audio->eof_rewinds++;
         if (fread(raw, 1, sizeof(raw), audio->file) != sizeof(raw))
             return 0.0f;
     }
     sample = (int16_t)((uint16_t)raw[0] | ((uint16_t)raw[1] << 8));
+    audio->samples_read++;
     return (float)sample / 32768.0f;
 }
 
@@ -980,6 +990,23 @@ static void tx_output_metrics_add(struct tx_output_metrics *metrics, int16_t i_v
     metrics->sample_count++;
 }
 
+static void tx_output_metrics_add_audio(struct tx_output_metrics *metrics, float audio)
+{
+    double abs_audio;
+
+    if (!metrics)
+        return;
+    if (metrics->audio_have_last && metrics->audio_last < 0.0f && audio >= 0.0f)
+        metrics->audio_crossing_count++;
+    metrics->audio_have_last = true;
+    metrics->audio_last = audio;
+    metrics->audio_sumsq += (double)audio * (double)audio;
+    abs_audio = fabs((double)audio);
+    if (abs_audio > metrics->audio_peak)
+        metrics->audio_peak = abs_audio;
+    metrics->audio_sample_count++;
+}
+
 static void fill_tx_modulated(struct iio_buffer *buf, struct iio_channel *i_chan,
                               const struct tx_config *cfg, struct tx_state *state,
                               struct tx_output_metrics *metrics)
@@ -998,12 +1025,14 @@ static void fill_tx_modulated(struct iio_buffer *buf, struct iio_channel *i_chan
             i_val = level;
         } else if (mode_is(cfg->mode, "am")) {
             float audio = audio_next_sample(&state->audio, cfg);
+            tx_output_metrics_add_audio(metrics, audio);
             float envelope = (1.0f + cfg->am_modulation_index * audio) / (1.0f + cfg->am_modulation_index);
             if (envelope < 0.0f)
                 envelope = 0.0f;
             i_val = level * envelope;
         } else if (mode_is(cfg->mode, "fm")) {
             float audio = audio_next_sample(&state->audio, cfg);
+            tx_output_metrics_add_audio(metrics, audio);
             state->fm_phase += 2.0f * (float)M_PI * (float)cfg->fm_deviation_hz * audio / (float)cfg->sample_rate;
             if (state->fm_phase > 2.0f * (float)M_PI)
                 state->fm_phase -= 2.0f * (float)M_PI;
@@ -1332,22 +1361,55 @@ out:
         double tx_rms = sqrt(tx_metrics.sumsq / (double)tx_metrics.sample_count);
         double tx_rms_dbfs = 20.0 * log10(tx_rms > 1.0e-9 ? tx_rms : 1.0e-9);
         double tx_peak_dbfs = 20.0 * log10(tx_metrics.peak > 1.0e-9 ? tx_metrics.peak : 1.0e-9);
+        double tx_audio_rms = tx_metrics.audio_sample_count > 0 ?
+            sqrt(tx_metrics.audio_sumsq / (double)tx_metrics.audio_sample_count) : 0.0;
+        double tx_measured_audio_tone_hz = 0.0;
+        bool have_measured_audio_tone =
+            tx_metrics.audio_sample_count > 0 &&
+            strcmp(tx_cfg.audio_source, "file") != 0 &&
+            (mode_is(tx_cfg.mode, "fm") || mode_is(tx_cfg.mode, "am"));
+
+        if (have_measured_audio_tone) {
+            tx_measured_audio_tone_hz =
+                (double)tx_metrics.audio_crossing_count * (double)sample_rate /
+                (double)tx_metrics.audio_sample_count;
+        }
 
         printf("{\"ok\":true,\"mode\":\"tx_only\",\"tx_mode\":\"%s\",\"duration_ms\":%ld,"
                "\"sample_rate_hz\":%ld,\"tone_hz\":%ld,"
                "\"tx_amplitude\":%.6f,\"audio_source\":\"%s\","
-               "\"audio_rate_hz\":%ld,\"audio_tone_hz\":%ld,"
-               "\"fm_deviation_hz\":%ld,\"am_modulation_index\":%.3f,"
+               "\"tx_audio_source\":\"%s\","
+               "\"audio_rate_hz\":%ld,\"tx_audio_rate_hz\":%ld,"
+               "\"audio_tone_hz\":%ld,\"tx_audio_tone_hz\":%ld,"
+               "\"fm_deviation_hz\":%ld,\"tx_fm_deviation_hz\":%ld,"
+               "\"am_modulation_index\":%.3f,\"tx_am_modulation_index\":%.3f,"
                "\"cw_wpm\":%ld,"
                "\"tx_push_count\":%llu,\"tx_sample_count\":%llu,"
                "\"tx_transition_count\":%llu,\"tx_rms_dbfs\":%.2f,"
-               "\"tx_peak_dbfs\":%.2f}\n",
+               "\"tx_peak_dbfs\":%.2f,"
+               "\"tx_audio_sample_count\":%llu,\"tx_audio_crossing_count\":%llu,"
+               "\"tx_audio_rms\":%.9f,\"tx_audio_peak\":%.9f,"
+               "\"tx_audio_file_samples_read\":%llu,"
+               "\"tx_audio_file_rewinds\":%llu",
                tx_cfg.mode, duration_ms, sample_rate, tone_hz,
-               amplitude, tx_cfg.audio_source, tx_cfg.audio_rate,
-               tx_cfg.audio_tone_hz, tx_cfg.fm_deviation_hz,
-               tx_cfg.am_modulation_index, tx_cfg.cw_wpm,
+               amplitude, tx_cfg.audio_source, tx_cfg.audio_source,
+               tx_cfg.audio_rate, tx_cfg.audio_rate,
+               tx_cfg.audio_tone_hz, tx_cfg.audio_tone_hz,
+               tx_cfg.fm_deviation_hz, tx_cfg.fm_deviation_hz,
+               tx_cfg.am_modulation_index, tx_cfg.am_modulation_index,
+               tx_cfg.cw_wpm,
                tx_push_count, tx_metrics.sample_count,
-               tx_metrics.transition_count, tx_rms_dbfs, tx_peak_dbfs);
+               tx_metrics.transition_count, tx_rms_dbfs, tx_peak_dbfs,
+               tx_metrics.audio_sample_count, tx_metrics.audio_crossing_count,
+               tx_audio_rms, tx_metrics.audio_peak,
+               tx_state.audio.samples_read, tx_state.audio.eof_rewinds);
+        if (have_measured_audio_tone) {
+            printf(",\"tx_measured_audio_tone_hz\":%.2f,"
+                   "\"tx_audio_tone_error_hz\":%.2f",
+                   tx_measured_audio_tone_hz,
+                   tx_measured_audio_tone_hz - (double)tx_cfg.audio_tone_hz);
+        }
+        printf("}\n");
     }
     return ret;
 }

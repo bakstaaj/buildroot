@@ -1,7 +1,7 @@
 {
   "name": "TX_TEST_TONE",
   "label": "Bounded TX test tone",
-  "description": "Explicit, bounded low-power TX tone profile for transceiver application testing.",
+  "description": "Explicit, bounded low-power FM audio tone profile for transceiver application testing.",
   "default_frequency_hz": 915000000,
   "sample_rate_hz": 2400000,
   "rf_bandwidth_hz": 1000000,
@@ -18,10 +18,14 @@
   "dc_block": true,
   "stream_format": "sc16_iq",
   "tx_allowed": true,
-  "tx_mode": "tone",
+  "tx_mode": "fm",
   "tx_duration_limit_seconds": 10,
   "tx_gain_db": -30.0,
-  "tx_tone_hz": 10000,
+  "tx_tone_hz": 0,
   "tx_amplitude": 0.05,
+  "tx_audio_source": "tone",
+  "tx_audio_rate_hz": 8000,
+  "tx_audio_tone_hz": 1000,
+  "tx_fm_deviation_hz": 5000,
   "loopback_duration_limit_seconds": 5
 }
