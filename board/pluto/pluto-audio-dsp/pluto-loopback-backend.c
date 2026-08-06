@@ -107,10 +107,16 @@ static int16_t clamp16(float value)
 
 struct audio_state {
     FILE *file;
+    int16_t *file_samples;
+    size_t file_sample_count;
+    size_t file_sample_index;
     bool file_repeat;
     float current;
     float file_accum;
     float tone_phase;
+    float tone_i;
+    float tone_q;
+    unsigned tone_renorm;
     unsigned long long samples_read;
     unsigned long long eof_rewinds;
 };
@@ -157,7 +163,13 @@ struct tx_config {
 struct tx_state {
     float tone_phase;
     float fm_phase;
+    float fm_i;
+    float fm_q;
+    unsigned fm_renorm;
     struct audio_state audio;
+    int16_t *cached_iq;
+    size_t cached_iq_samples;
+    size_t cached_iq_index;
     struct cw_state cw;
     struct ft8_state ft8;
 };
@@ -176,6 +188,8 @@ struct tx_output_metrics {
     int16_t last_q;
     double sumsq;
     double peak;
+    double peak_mag2;
+    bool lightweight_audio_metrics;
 };
 
 static void ft8_init(struct ft8_state *state, const char *text, long sample_rate)
@@ -334,18 +348,47 @@ static void fill_tx_tone(struct iio_buffer *buf, struct iio_channel *i_chan,
     char *ptr = iio_buffer_first(buf, i_chan);
     char *end = iio_buffer_end(buf);
     ptrdiff_t step = iio_buffer_step(buf);
-    float phase = 0.0f;
+    float nco_i = 1.0f;
+    float nco_q = 0.0f;
     float inc = 2.0f * (float)M_PI * (float)tone_hz / (float)sample_rate;
+    unsigned renorm = 0;
     float level = amplitude * INT16_MAX_F;
 
     for (; ptr < end; ptr += step) {
         int16_t *sample = (int16_t *)ptr;
-        sample[0] = clamp16(cosf(phase) * level);
-        sample[1] = clamp16(sinf(phase) * level);
-        phase += inc;
-        if (phase > 2.0f * (float)M_PI)
-            phase -= 2.0f * (float)M_PI;
+        sample[0] = clamp16(nco_i * level);
+        sample[1] = clamp16(nco_q * level);
+        {
+            float rot_i = 1.0f - 0.5f * inc * inc;
+            float old_i = nco_i;
+            float old_q = nco_q;
+            nco_i = old_i * rot_i - old_q * inc;
+            nco_q = old_q * rot_i + old_i * inc;
+        }
+        if ((++renorm & 31U) == 0U) {
+            float scale = 1.5f - 0.5f * (nco_i * nco_i + nco_q * nco_q);
+            nco_i *= scale;
+            nco_q *= scale;
+        }
     }
+}
+
+static inline void nco_rotate(float *i, float *q, float delta)
+{
+    float delta2 = delta * delta;
+    float rot_i = 1.0f - 0.5f * delta2 + (delta2 * delta2) / 24.0f;
+    float rot_q = delta - (delta * delta2) / 6.0f;
+    float old_i = *i;
+    float old_q = *q;
+    *i = old_i * rot_i - old_q * rot_q;
+    *q = old_q * rot_i + old_i * rot_q;
+}
+
+static inline void nco_renormalize(float *i, float *q)
+{
+    float scale = 1.5f - 0.5f * (*i * *i + *q * *q);
+    *i *= scale;
+    *q *= scale;
 }
 
 static const char *morse_pattern(char c)
@@ -914,8 +957,12 @@ static bool cw_next_key(struct cw_state *cw)
 
 static int audio_open(struct audio_state *audio, const struct tx_config *cfg)
 {
+    long file_bytes;
+
     memset(audio, 0, sizeof(*audio));
     audio->file_repeat = true;
+    /* Emit the first preloaded PCM sample on the first TX sample. */
+    audio->file_accum = 1.0f;
     if (strcmp(cfg->audio_source, "file") != 0)
         return 0;
     audio->file = fopen(cfg->audio_path, "rb");
@@ -923,24 +970,45 @@ static int audio_open(struct audio_state *audio, const struct tx_config *cfg)
         fprintf(stderr, "could not open TX audio path: %s\n", cfg->audio_path);
         return -1;
     }
+    if (fseek(audio->file, 0, SEEK_END) != 0 ||
+        (file_bytes = ftell(audio->file)) < 2 ||
+        (file_bytes & 1L) != 0 ||
+        fseek(audio->file, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "invalid TX audio file: %s\n", cfg->audio_path);
+        fclose(audio->file);
+        audio->file = NULL;
+        return -1;
+    }
+    audio->file_sample_count = (size_t)file_bytes / sizeof(int16_t);
+    audio->file_samples = malloc(audio->file_sample_count * sizeof(*audio->file_samples));
+    if (!audio->file_samples ||
+        fread(audio->file_samples, sizeof(*audio->file_samples),
+              audio->file_sample_count, audio->file) != audio->file_sample_count) {
+        fprintf(stderr, "could not preload TX audio file: %s\n", cfg->audio_path);
+        free(audio->file_samples);
+        audio->file_samples = NULL;
+        fclose(audio->file);
+        audio->file = NULL;
+        return -1;
+    }
+    fclose(audio->file);
+    audio->file = NULL;
     return 0;
 }
 
 static float audio_read_file_sample(struct audio_state *audio)
 {
-    unsigned char raw[2];
     int16_t sample;
 
-    if (!audio->file)
+    if (!audio->file_samples || audio->file_sample_count == 0)
         return 0.0f;
-    if (fread(raw, 1, sizeof(raw), audio->file) != sizeof(raw)) {
-        if (!audio->file_repeat || fseek(audio->file, 0, SEEK_SET) != 0)
+    if (audio->file_sample_index >= audio->file_sample_count) {
+        if (!audio->file_repeat)
             return 0.0f;
         audio->eof_rewinds++;
-        if (fread(raw, 1, sizeof(raw), audio->file) != sizeof(raw))
-            return 0.0f;
+        audio->file_sample_index = 0;
     }
-    sample = (int16_t)((uint16_t)raw[0] | ((uint16_t)raw[1] << 8));
+    sample = audio->file_samples[audio->file_sample_index++];
     audio->samples_read++;
     return (float)sample / 32768.0f;
 }
@@ -958,11 +1026,82 @@ static float audio_next_sample(struct audio_state *audio, const struct tx_config
         return audio->current;
     }
 
-    sample = sinf(audio->tone_phase);
-    audio->tone_phase += 2.0f * (float)M_PI * (float)cfg->audio_tone_hz / (float)cfg->sample_rate;
-    if (audio->tone_phase > 2.0f * (float)M_PI)
-        audio->tone_phase -= 2.0f * (float)M_PI;
+    if (audio->tone_i == 0.0f && audio->tone_q == 0.0f)
+        audio->tone_i = 1.0f;
+    sample = audio->tone_q;
+    nco_rotate(&audio->tone_i, &audio->tone_q,
+               2.0f * (float)M_PI * (float)cfg->audio_tone_hz /
+               (float)cfg->sample_rate);
+    if ((++audio->tone_renorm & 31U) == 0U)
+        nco_renormalize(&audio->tone_i, &audio->tone_q);
     return sample;
+}
+
+static int tx_prepare_cached_fm(struct tx_state *state, const struct tx_config *cfg)
+{
+    size_t samples;
+    float fm_i = 1.0f;
+    float fm_q = 0.0f;
+    unsigned renorm = 0;
+    float level;
+
+    if (strcmp(cfg->mode, "fm") != 0 || strcmp(cfg->audio_source, "file") != 0 ||
+        !state->audio.file_samples || state->audio.file_sample_count == 0)
+        return 0;
+    samples = (size_t)(((unsigned long long)state->audio.file_sample_count *
+                        (unsigned long long)cfg->sample_rate +
+                        (unsigned long long)cfg->audio_rate - 1ULL) /
+                       (unsigned long long)cfg->audio_rate);
+    if (samples == 0 || samples > 4U * 1024U * 1024U)
+        return 0;
+    state->cached_iq = malloc(samples * 2U * sizeof(*state->cached_iq));
+    if (!state->cached_iq)
+        return -1;
+    level = cfg->amplitude * INT16_MAX_F;
+    for (size_t n = 0; n < samples; n++) {
+        float audio = audio_next_sample(&state->audio, cfg);
+        float delta = 2.0f * (float)M_PI * (float)cfg->fm_deviation_hz * audio /
+                      (float)cfg->sample_rate;
+        state->cached_iq[2U * n] = clamp16(fm_i * level);
+        state->cached_iq[2U * n + 1U] = clamp16(fm_q * level);
+        {
+            float rot_i = cosf(delta);
+            float rot_q = sinf(delta);
+            float old_i = fm_i;
+            float old_q = fm_q;
+            fm_i = old_i * rot_i - old_q * rot_q;
+            fm_q = old_q * rot_i + old_i * rot_q;
+        }
+        if ((++renorm & 31U) == 0U)
+            nco_renormalize(&fm_i, &fm_q);
+    }
+    state->cached_iq_samples = samples;
+    state->cached_iq_index = 0;
+    state->audio.file_sample_index = 0;
+    /* The packet was consumed while building the cache; replay is memory-only. */
+    state->audio.samples_read = state->audio.file_sample_count;
+    state->audio.eof_rewinds = 1;
+    return 0;
+}
+
+static void tx_output_metrics_add(struct tx_output_metrics *metrics,
+                                  int16_t i_val, int16_t q_val);
+
+static void fill_tx_cached(struct iio_buffer *buf, struct iio_channel *i_chan,
+                           struct tx_state *state,
+                           struct tx_output_metrics *metrics)
+{
+    char *ptr = iio_buffer_first(buf, i_chan);
+    char *end = iio_buffer_end(buf);
+    ptrdiff_t step = iio_buffer_step(buf);
+
+    for (; ptr < end; ptr += step) {
+        int16_t *sample = (int16_t *)ptr;
+        size_t index = state->cached_iq_index++ % state->cached_iq_samples;
+        sample[0] = state->cached_iq[2U * index];
+        sample[1] = state->cached_iq[2U * index + 1U];
+        tx_output_metrics_add(metrics, sample[0], sample[1]);
+    }
 }
 
 static void tx_output_metrics_add(struct tx_output_metrics *metrics, int16_t i_val, int16_t q_val)
@@ -970,9 +1109,12 @@ static void tx_output_metrics_add(struct tx_output_metrics *metrics, int16_t i_v
     double i_norm;
     double q_norm;
     double mag2;
-    double mag;
 
     if (!metrics)
+        return;
+    metrics->sample_count++;
+    if (metrics->lightweight_audio_metrics &&
+        (metrics->sample_count & 7U) != 0U)
         return;
     if (metrics->have_last && (i_val != metrics->last_i || q_val != metrics->last_q))
         metrics->transition_count++;
@@ -983,11 +1125,12 @@ static void tx_output_metrics_add(struct tx_output_metrics *metrics, int16_t i_v
     i_norm = (double)i_val / 32768.0;
     q_norm = (double)q_val / 32768.0;
     mag2 = i_norm * i_norm + q_norm * q_norm;
-    mag = sqrt(mag2);
-    metrics->sumsq += mag2;
-    if (mag > metrics->peak)
-        metrics->peak = mag;
-    metrics->sample_count++;
+    metrics->sumsq += mag2 *
+                      (metrics->lightweight_audio_metrics ? 8.0 : 1.0);
+    if (mag2 > metrics->peak_mag2) {
+        metrics->peak_mag2 = mag2;
+        metrics->peak = sqrt(mag2);
+    }
 }
 
 static void tx_output_metrics_add_audio(struct tx_output_metrics *metrics, float audio)
@@ -996,15 +1139,19 @@ static void tx_output_metrics_add_audio(struct tx_output_metrics *metrics, float
 
     if (!metrics)
         return;
+    metrics->audio_sample_count++;
+    if (metrics->lightweight_audio_metrics &&
+        (metrics->audio_sample_count & 7U) != 0U)
+        return;
     if (metrics->audio_have_last && metrics->audio_last < 0.0f && audio >= 0.0f)
         metrics->audio_crossing_count++;
     metrics->audio_have_last = true;
     metrics->audio_last = audio;
-    metrics->audio_sumsq += (double)audio * (double)audio;
+    metrics->audio_sumsq += (double)audio * (double)audio *
+                            (metrics->lightweight_audio_metrics ? 8.0 : 1.0);
     abs_audio = fabs((double)audio);
     if (abs_audio > metrics->audio_peak)
         metrics->audio_peak = abs_audio;
-    metrics->audio_sample_count++;
 }
 
 static void fill_tx_modulated(struct iio_buffer *buf, struct iio_channel *i_chan,
@@ -1032,14 +1179,18 @@ static void fill_tx_modulated(struct iio_buffer *buf, struct iio_channel *i_chan
             i_val = level * envelope;
         } else if (mode_is(cfg->mode, "fm")) {
             float audio = audio_next_sample(&state->audio, cfg);
+            float delta;
+
             tx_output_metrics_add_audio(metrics, audio);
-            state->fm_phase += 2.0f * (float)M_PI * (float)cfg->fm_deviation_hz * audio / (float)cfg->sample_rate;
-            if (state->fm_phase > 2.0f * (float)M_PI)
-                state->fm_phase -= 2.0f * (float)M_PI;
-            if (state->fm_phase < -2.0f * (float)M_PI)
-                state->fm_phase += 2.0f * (float)M_PI;
-            i_val = cosf(state->fm_phase) * level;
-            q_val = sinf(state->fm_phase) * level;
+            if (state->fm_i == 0.0f && state->fm_q == 0.0f)
+                state->fm_i = 1.0f;
+            i_val = state->fm_i * level;
+            q_val = state->fm_q * level;
+            delta = 2.0f * (float)M_PI * (float)cfg->fm_deviation_hz * audio /
+                    (float)cfg->sample_rate;
+            nco_rotate(&state->fm_i, &state->fm_q, delta);
+            if ((++state->fm_renorm & 31U) == 0U)
+                nco_renormalize(&state->fm_i, &state->fm_q);
         } else if (mode_is(cfg->mode, "cw")) {
             if (cw_next_key(&state->cw))
                 i_val = level;
@@ -1047,17 +1198,46 @@ static void fill_tx_modulated(struct iio_buffer *buf, struct iio_channel *i_chan
             ft8_next_iq(&state->ft8, cfg->sample_rate, level,
                         (float)cfg->audio_tone_hz, &i_val, &q_val);
         } else {
-            i_val = cosf(state->tone_phase) * level;
-            q_val = sinf(state->tone_phase) * level;
-            state->tone_phase += 2.0f * (float)M_PI * (float)cfg->tone_hz / (float)cfg->sample_rate;
-            if (state->tone_phase > 2.0f * (float)M_PI)
-                state->tone_phase -= 2.0f * (float)M_PI;
+            if (state->fm_i == 0.0f && state->fm_q == 0.0f)
+                state->fm_i = 1.0f;
+            i_val = state->fm_i * level;
+            q_val = state->fm_q * level;
+            nco_rotate(&state->fm_i, &state->fm_q,
+                       2.0f * (float)M_PI * (float)cfg->tone_hz /
+                       (float)cfg->sample_rate);
+            if ((++state->fm_renorm & 31U) == 0U)
+                nco_renormalize(&state->fm_i, &state->fm_q);
         }
 
         sample[0] = clamp16(i_val);
         sample[1] = clamp16(q_val);
         tx_output_metrics_add(metrics, sample[0], sample[1]);
     }
+}
+
+/*
+ * libiio can pace local TX buffers below the AD9361 sysfs rate.  Use the
+ * completed-buffer rate for audio resampling and FM phase accumulation so a
+ * valid PCM waveform remains valid on either path.
+ */
+static void update_tx_runtime_rate(struct tx_output_metrics *metrics,
+                                   unsigned long long *last_samples,
+                                   double *last_time,
+                                   long *runtime_rate)
+{
+    const double now = monotonic_seconds();
+    const unsigned long long sample_delta = metrics->sample_count - *last_samples;
+    const double time_delta = now - *last_time;
+    long measured_rate;
+
+    if (sample_delta < 32768 || time_delta < 0.01)
+        return;
+    measured_rate = (long)((double)sample_delta / time_delta + 0.5);
+    if (measured_rate < 100000 || measured_rate > 100000000)
+        return;
+    *runtime_rate = measured_rate;
+    *last_samples = metrics->sample_count;
+    *last_time = now;
 }
 
 static void tone_metric_add(struct tone_metric *metric, double sample, long index, long sample_rate)
@@ -1175,10 +1355,14 @@ static int run_loopback(void)
     struct cw_decode_metrics cw_decode;
     struct tx_output_metrics tx_metrics;
     unsigned long long tx_push_count = 0;
+    unsigned long long tx_rate_last_samples = 0;
+    double tx_rate_last_time = 0.0;
+    long tx_runtime_rate = 0;
     int ret = 1;
 
     memset(&tx_state, 0, sizeof(tx_state));
     memset(&tx_metrics, 0, sizeof(tx_metrics));
+    tx_metrics.lightweight_audio_metrics = strcmp(tx_cfg.audio_source, "file") == 0;
     build_cw_units(&tx_state.cw, tx_cfg.cw_text, sample_rate, tx_cfg.cw_wpm);
     ft8_init(&tx_state.ft8, tx_cfg.ft8_text, sample_rate);
     if (mode_is(tx_cfg.mode, "ft8") && !tx_state.ft8.valid) {
@@ -1186,6 +1370,8 @@ static int run_loopback(void)
         goto out;
     }
     if (audio_open(&tx_state.audio, &tx_cfg) < 0)
+        goto out;
+    if (tx_prepare_cached_fm(&tx_state, &tx_cfg) < 0)
         goto out;
     demod_metrics_init(&demod, tx_cfg.mode, sample_rate, expect_tone_hz, carrier_offset_hz);
     cw_decode_init(&cw_decode, tx_cfg.mode, sample_rate, tx_cfg.cw_wpm,
@@ -1220,6 +1406,8 @@ static int run_loopback(void)
     }
     if (mode_is(tx_cfg.mode, "loopback"))
         fill_tx_tone(tx_buf, tx_i, sample_rate, tone_hz, amplitude);
+    else if (tx_state.cached_iq)
+        fill_tx_cached(tx_buf, tx_i, &tx_state, &tx_metrics);
     else
         fill_tx_modulated(tx_buf, tx_i, &tx_cfg, &tx_state, &tx_metrics);
     if (iio_buffer_push(tx_buf) < 0) {
@@ -1227,6 +1415,8 @@ static int run_loopback(void)
         goto out;
     }
     tx_push_count++;
+    tx_rate_last_samples = tx_metrics.sample_count;
+    tx_rate_last_time = monotonic_seconds();
 
     started = monotonic_seconds();
     while (keep_running && ((monotonic_seconds() - started) * 1000.0) < (double)duration_ms) {
@@ -1236,21 +1426,41 @@ static int run_loopback(void)
         ptrdiff_t step;
 
         if (tx_only) {
-            fill_tx_modulated(tx_buf, tx_i, &tx_cfg, &tx_state, &tx_metrics);
+            struct tx_config runtime_tx_cfg = tx_cfg;
+
+            /* Pace generated audio against the rate the local IIO path is delivering. */
+            if (tx_runtime_rate > 0)
+                runtime_tx_cfg.sample_rate = tx_runtime_rate;
+            if (tx_state.cached_iq)
+                fill_tx_cached(tx_buf, tx_i, &tx_state, &tx_metrics);
+            else
+                fill_tx_modulated(tx_buf, tx_i, &runtime_tx_cfg, &tx_state, &tx_metrics);
             if (iio_buffer_push(tx_buf) < 0) {
                 fprintf(stderr, "TX buffer push failed\n");
                 goto out;
             }
             tx_push_count++;
+            if (tx_only)
+                update_tx_runtime_rate(&tx_metrics,
+                                       &tx_rate_last_samples, &tx_rate_last_time,
+                                       &tx_runtime_rate);
             continue;
         }
-        if (!mode_is(tx_cfg.mode, "loopback"))
-            fill_tx_modulated(tx_buf, tx_i, &tx_cfg, &tx_state, &tx_metrics);
+        if (!mode_is(tx_cfg.mode, "loopback")) {
+            if (tx_state.cached_iq)
+                fill_tx_cached(tx_buf, tx_i, &tx_state, &tx_metrics);
+            else
+                fill_tx_modulated(tx_buf, tx_i, &tx_cfg, &tx_state, &tx_metrics);
+        }
         if (iio_buffer_push(tx_buf) < 0) {
             fprintf(stderr, "TX buffer push failed\n");
             goto out;
         }
         tx_push_count++;
+        if (tx_only)
+            update_tx_runtime_rate(&tx_metrics,
+                                   &tx_rate_last_samples, &tx_rate_last_time,
+                                   &tx_runtime_rate);
         refill = iio_buffer_refill(rx_buf);
         if (refill < 0) {
             fprintf(stderr, "RX buffer refill failed: %zd\n", refill);
@@ -1288,6 +1498,8 @@ out:
         iio_buffer_destroy(rx_buf);
     if (tx_state.audio.file)
         fclose(tx_state.audio.file);
+    free(tx_state.audio.file_samples);
+    free(tx_state.cached_iq);
     free(tx_state.ft8.pulse);
     if (ctx)
         iio_context_destroy(ctx);
@@ -1370,13 +1582,20 @@ out:
             (mode_is(tx_cfg.mode, "fm") || mode_is(tx_cfg.mode, "am"));
 
         if (have_measured_audio_tone) {
+            const double average_runtime_rate =
+                tx_metrics.sample_count > 0 && duration_ms > 0 ?
+                (double)tx_metrics.sample_count * 1000.0 / (double)duration_ms :
+                (double)(tx_runtime_rate > 0 ? tx_runtime_rate : sample_rate);
+
             tx_measured_audio_tone_hz =
-                (double)tx_metrics.audio_crossing_count * (double)sample_rate /
+                (double)tx_metrics.audio_crossing_count *
+                average_runtime_rate /
                 (double)tx_metrics.audio_sample_count;
         }
 
         printf("{\"ok\":true,\"mode\":\"tx_only\",\"tx_mode\":\"%s\",\"duration_ms\":%ld,"
                "\"sample_rate_hz\":%ld,\"tone_hz\":%ld,"
+               "\"tx_runtime_sample_rate_hz\":%ld,"
                "\"tx_amplitude\":%.6f,\"audio_source\":\"%s\","
                "\"tx_audio_source\":\"%s\","
                "\"audio_rate_hz\":%ld,\"tx_audio_rate_hz\":%ld,"
@@ -1392,6 +1611,7 @@ out:
                "\"tx_audio_file_samples_read\":%llu,"
                "\"tx_audio_file_rewinds\":%llu",
                tx_cfg.mode, duration_ms, sample_rate, tone_hz,
+               tx_runtime_rate > 0 ? tx_runtime_rate : sample_rate,
                amplitude, tx_cfg.audio_source, tx_cfg.audio_source,
                tx_cfg.audio_rate, tx_cfg.audio_rate,
                tx_cfg.audio_tone_hz, tx_cfg.audio_tone_hz,
