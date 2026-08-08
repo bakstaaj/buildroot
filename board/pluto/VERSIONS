@@ -1,0 +1,5 @@
+device-fw v0.39-N0JCG.5f
+hdl 10124
+buildroot 1f0f3-dirty
+linux 1210
+u-boot-xlnx db18
